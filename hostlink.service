@@ -1,0 +1,29 @@
+[Unit]
+Description=HostLink Command Execution Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/hostlinkd -c /etc/hostlink/hostlink.conf
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=/run/hostlink/hostlink.pid
+Restart=always
+RestartSec=3
+
+# systemd creates /run/hostlink/ on start, removes it on stop.
+RuntimeDirectory=hostlink
+RuntimeDirectoryMode=0750
+
+# Create the output subdirectory for file-mode results.
+ExecStartPre=/bin/mkdir -p /run/hostlink/output
+ExecStartPre=/bin/chown hostlink:hostlink /run/hostlink/output
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

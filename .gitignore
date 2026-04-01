@@ -1,0 +1,5 @@
+build/
+*.o
+*.a
+*.d
+/tests/fixtures/test_output/

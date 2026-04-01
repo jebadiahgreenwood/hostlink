@@ -1,0 +1,42 @@
+# /etc/hostlink/hostlink.conf
+# Example configuration for hostlinkd
+
+# Human-readable name for this node. Returned in every response.
+node_name = desktop
+
+# Pre-shared authentication token. Must be identical on client and daemon.
+# Generate with: openssl rand -hex 32
+auth_token = REPLACE_WITH_GENERATED_TOKEN
+
+# --- Unix socket transport ---
+unix_enabled = true
+unix_path = /run/hostlink/hostlink.sock
+# File permissions on the socket (octal). 0660 = owner+group read/write.
+unix_mode = 0660
+# Group ownership of the socket.
+unix_group = hostlink
+
+# --- TCP transport ---
+tcp_enabled = false
+# Bind address. Use WireGuard interface IP to restrict exposure.
+tcp_bind = 10.0.0.1
+tcp_port = 9876
+
+# --- Execution limits ---
+max_concurrent = 8
+default_timeout_ms = 30000
+max_timeout_ms = 300000
+shell = /bin/sh
+
+# --- Output limits ---
+default_max_output_bytes = 4194304
+max_output_bytes = 67108864
+output_tmpdir = /run/hostlink/output
+
+# --- Logging ---
+# Options: "syslog", "stderr", or a file path
+log_target = syslog
+log_level = info
+
+# --- Security ---
+run_as_user = hostlink
