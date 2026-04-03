@@ -56,7 +56,7 @@ static int setup_unix_socket(const char *path, int mode, const char *group) {
     chmod(path, (mode_t)mode);
     if (group && group[0]) {
         struct group *gr = getgrnam(group);
-        if (gr) chown(path, (uid_t)-1, gr->gr_gid);
+        if (gr) { if (chown(path, (uid_t)-1, gr->gr_gid) != 0) log_warn("chown failed on %s", path); }
         else log_warn("group '%s' not found, skipping chown", group);
     }
     if (listen(fd, 64) != 0) { perror("listen(unix)"); close(fd); return -1; }

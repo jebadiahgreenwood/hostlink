@@ -5,8 +5,8 @@ MODE="${1:-release}"
 
 case "$MODE" in
   release)
-    CFLAGS="-std=c11 -O2 -flto -DNDEBUG -Wall -Wextra -Werror -pedantic"
-    LDFLAGS="-flto -s"
+    CFLAGS="-std=c11 -O2 -DNDEBUG -Wall -Wextra -Werror -pedantic"
+    LDFLAGS="-s"
     ;;
   debug)
     CFLAGS="-std=c11 -O0 -g3 -fsanitize=address,undefined -Wall -Wextra -Werror -pedantic"
