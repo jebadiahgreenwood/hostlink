@@ -81,7 +81,7 @@ $(TEST_CFG): $(TEST_CFG_OBJS) $(COMMON_OBJS)
 # Compile common objects
 $(BLDDIR)/common/cjson/cJSON.o: $(SRCDIR)/common/cjson/cJSON.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -Wno-pedantic -c -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDES) -Wno-pedantic -Wno-error=implicit-function-declaration -Wno-error=int-to-pointer-cast -Wno-error=unused-function -c -o $@ $<
 
 $(BLDDIR)/common/%.o: $(SRCDIR)/common/%.c
 	@mkdir -p $(dir $@)
