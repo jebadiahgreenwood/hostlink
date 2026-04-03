@@ -85,7 +85,25 @@ static int setup_tcp_socket(const char *bind_addr, int port) {
     return fd;
 }
 
+static void mkdir_parent(const char *path) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    char *p = strrchr(tmp, '/');
+    if (!p || p == tmp) return;
+    *p = '\0';
+    /* mkdir -p equivalent: walk and create each component */
+    for (char *q = tmp + 1; *q; q++) {
+        if (*q == '/') {
+            *q = '\0';
+            mkdir(tmp, 0755);
+            *q = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
 static void write_pidfile(const char *path) {
+    mkdir_parent(path);
     FILE *f = fopen(path, "w");
     if (!f) { log_warn("cannot write PID file %s: %s", path, strerror(errno)); return; }
     fprintf(f, "%d\n", getpid());

@@ -79,10 +79,11 @@ static void daemon_cfg_cb(const char *section, const char *key,
     daemon_config_t *cfg = (daemon_config_t *)userdata;
 #define STR(field) if (!strcmp(key, #field)) { snprintf(cfg->field, sizeof(cfg->field), "%s", value); return; }
 #define INT(field) if (!strcmp(key, #field)) { cfg->field = atoi(value); return; }
+#define BOOL(field) if (!strcmp(key, #field)) {     cfg->field = (!strcmp(value,"true")||!strcmp(value,"yes")||!strcmp(value,"1")) ? 1 : 0; return; }
     STR(node_name) STR(auth_token) STR(unix_path) STR(unix_group)
     STR(tcp_bind) STR(shell) STR(output_tmpdir) STR(log_target) STR(log_level)
     STR(run_as_user)
-    INT(unix_enabled) INT(tcp_enabled) INT(tcp_port)
+    BOOL(unix_enabled) BOOL(tcp_enabled) INT(tcp_port)
     INT(max_concurrent) INT(default_timeout_ms) INT(max_timeout_ms)
     if (!strcmp(key, "unix_mode")) {
         cfg->unix_mode = (int)strtol(value, NULL, 8); return;
@@ -95,6 +96,7 @@ static void daemon_cfg_cb(const char *section, const char *key,
     }
 #undef STR
 #undef INT
+#undef BOOL
 }
 
 int daemon_config_load(const char *path, daemon_config_t *cfg) {
