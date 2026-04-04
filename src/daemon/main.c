@@ -117,7 +117,7 @@ static int check_existing_instance(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;  /* no PID file — safe to start */
     pid_t existing_pid = 0;
-    fscanf(f, "%d", &existing_pid);
+    (void)fscanf(f, "%d", &existing_pid);
     fclose(f);
     if (existing_pid <= 0) { unlink(path); return 0; }
     /* Check if the process is alive by sending signal 0 */
@@ -127,7 +127,7 @@ static int check_existing_instance(const char *path) {
         char comm_path[64];
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)existing_pid);
         FILE *cf = fopen(comm_path, "r");
-        if (cf) { fscanf(cf, "%255s", proc_comm); fclose(cf); }
+        if (cf) { (void)fscanf(cf, "%255s", proc_comm); fclose(cf); }
         if (strstr(proc_comm, "hostlinkd") != NULL) {
             fprintf(stderr, "ERROR: hostlinkd is already running (pid %d).\n"
                             "       Use 'kill %d' or 'systemctl restart hostlinkd' to restart.\n",
