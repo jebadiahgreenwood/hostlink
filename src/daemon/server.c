@@ -23,6 +23,7 @@
 #include "../common/cjson/cJSON.h"
 
 #define MAX_EVENTS 64
+#define HL_GET_MAX_FILE_SIZE (90u * 1024u * 1024u)
 
 static daemon_config_t *g_cfg        = NULL;
 static volatile int     g_running    = 1;
@@ -205,6 +206,102 @@ static void handle_put(int fd, cJSON *req) {
     cJSON_Delete(resp);
 }
 
+
+/*
+ * handle_get: read a file from the host and return base64-encoded content.
+ * Request fields:
+ *   path (string) - absolute path of the file to retrieve
+ */
+static void handle_get(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j;
+    j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    /* path */
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "get: path is required");
+        return;
+    }
+    const char *src_path = j->valuestring;
+
+    /* stat the file */
+    struct stat st;
+    if (stat(src_path, &st) < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "get: cannot open %s: %s", src_path, strerror(errno));
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    /* size check */
+    if ((size_t)st.st_size > HL_GET_MAX_FILE_SIZE) {
+        char msg[200];
+        snprintf(msg, sizeof(msg),
+                 "get: file too large (%zu bytes, max %u)",
+                 (size_t)st.st_size, HL_GET_MAX_FILE_SIZE);
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    size_t file_size = (size_t)st.st_size;
+
+    /* allocate read buffer */
+    unsigned char *buf = malloc(file_size + 1);
+    if (!buf) {
+        send_error(fd, req_id, "error", "get: out of memory");
+        return;
+    }
+
+    int rfd = open(src_path, O_RDONLY);
+    if (rfd < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "get: cannot open %s: %s", src_path, strerror(errno));
+        free(buf);
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    /* read entire file */
+    size_t total_read = 0;
+    while (total_read < file_size) {
+        ssize_t n = read(rfd, buf + total_read, file_size - total_read);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(rfd);
+            free(buf);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "get: read error: %s", strerror(errno));
+            send_error(fd, req_id, "error", msg);
+            return;
+        }
+        if (n == 0) break;
+        total_read += (size_t)n;
+    }
+    close(rfd);
+
+    /* base64 encode */
+    char *b64 = hl_b64_encode(buf, total_read);
+    free(buf);
+    if (!b64) {
+        send_error(fd, req_id, "error", "get: base64 encode failed");
+        return;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version", 1);
+    cJSON_AddStringToObject(resp, "id",      req_id);
+    cJSON_AddStringToObject(resp, "node",    g_cfg->node_name);
+    cJSON_AddStringToObject(resp, "status",  "ok");
+    cJSON_AddStringToObject(resp, "path",    src_path);
+    cJSON_AddNumberToObject(resp, "size",    (double)total_read);
+    cJSON_AddStringToObject(resp, "content", b64);
+    free(b64);
+    frame_send_json(fd, resp);
+    cJSON_Delete(resp);
+}
+
 /*
  * handle_exec: runs in a forked worker child.
  */
@@ -352,6 +449,14 @@ static void dispatch_connection(int client_fd) {
     /* put: inline, no fork needed (I/O bound not CPU bound, short-lived) */
     if (!strcmp(type, "put")) {
         handle_put(client_fd, req);
+        cJSON_Delete(req);
+        close(client_fd);
+        return;
+    }
+
+    /* get: inline, no fork needed */
+    if (!strcmp(type, "get")) {
+        handle_get(client_fd, req);
         cJSON_Delete(req);
         close(client_fd);
         return;

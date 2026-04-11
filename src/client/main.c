@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include "connection.h"
 #include "../common/protocol.h"
@@ -14,7 +15,7 @@
 #include "../common/log.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 
 #define EXIT_OK           0
 #define EXIT_REMOTE_ERR   1
@@ -384,6 +385,121 @@ static int cmd_put(cli_opts_t *opts, const char *local_path, const char *remote_
     return ret;
 }
 
+
+/*
+ * cmd_get: retrieve a file from the remote host to a local path.
+ * Usage: hostlink-cli [opts] get <remote_path> <local_path>
+ */
+static int cmd_get(cli_opts_t *opts, const char *remote_path, const char *local_path) {
+    int fd = open_connection(opts);
+    if (fd < 0) return EXIT_CONN_FAILED;
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "get");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+
+    if (frame_send_json(fd, req) != 0) {
+        cJSON_Delete(req); close(fd);
+        fprintf(stderr, "get: failed to send request\n");
+        return EXIT_CONN_FAILED;
+    }
+    cJSON_Delete(req);
+
+    char *payload = NULL;
+    ssize_t n = frame_recv(fd, &payload);
+    close(fd);
+    if (n <= 0) { free(payload); return EXIT_PROTO_ERR; }
+
+    cJSON *resp = cJSON_Parse(payload);
+    free(payload);
+    if (!resp) return EXIT_PROTO_ERR;
+
+    /* For get, always process the response (decode + write file) first,
+     * then print JSON if requested.  Unlike exec/put where -j replaces
+     * normal output, get must write the local file regardless. */
+    cJSON *j;
+    const char *status = "", *node = "", *error_msg = NULL, *content = NULL;
+    double size_bytes = 0;
+    j = cJSON_GetObjectItem(resp, "status");    if (cJSON_IsString(j)) status    = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "node");      if (cJSON_IsString(j)) node      = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "error_msg"); if (cJSON_IsString(j)) error_msg = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "content");   if (cJSON_IsString(j)) content   = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "size");      if (cJSON_IsNumber(j)) size_bytes = j->valuedouble;
+
+    int ret = EXIT_OK;
+    if (!strcmp(status, "auth_failed")) {
+        fprintf(stderr, "Authentication failed\n"); ret = EXIT_AUTH_FAILED;
+    } else if (!strcmp(status, "error") || !strcmp(status, "bad_request")) {
+        fprintf(stderr, "[%s] get error: %s\n", node, error_msg ? error_msg : "unknown");
+        ret = EXIT_REMOTE_ERR;
+    } else if (!strcmp(status, "ok")) {
+        if (!content) {
+            fprintf(stderr, "get: response missing content field\n");
+            cJSON_Delete(resp);
+            return EXIT_PROTO_ERR;
+        }
+        /* decode base64 */
+        size_t b64_len = strlen(content);
+        size_t max_decoded = hl_b64_decoded_len(content, b64_len) + 4;
+        unsigned char *data = malloc(max_decoded);
+        if (!data) {
+            fprintf(stderr, "get: out of memory\n");
+            cJSON_Delete(resp);
+            return EXIT_CLIENT_ERR;
+        }
+        ssize_t data_len = hl_b64_decode(content, b64_len, data, max_decoded);
+        if (data_len < 0) {
+            free(data);
+            fprintf(stderr, "get: invalid base64 in response\n");
+            cJSON_Delete(resp);
+            return EXIT_PROTO_ERR;
+        }
+        /* write to local file */
+        int wfd = open(local_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wfd < 0) {
+            free(data);
+            fprintf(stderr, "get: cannot write local file %s: %s\n",
+                    local_path, strerror(errno));
+            cJSON_Delete(resp);
+            return EXIT_CLIENT_ERR;
+        }
+        ssize_t written = 0;
+        while (written < data_len) {
+            ssize_t w = write(wfd, data + written, (size_t)(data_len - written));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                close(wfd);
+                free(data);
+                fprintf(stderr, "get: write error: %s\n", strerror(errno));
+                cJSON_Delete(resp);
+                return EXIT_CLIENT_ERR;
+            }
+            written += w;
+        }
+        close(wfd);
+        free(data);
+        if (!opts->json_output)
+            fprintf(stderr, "[%s] get ok: %s -> %s (%.0f bytes)\n",
+                    node, remote_path, local_path, size_bytes);
+    } else {
+        fprintf(stderr, "get: unexpected status: %s\n", status);
+        ret = EXIT_PROTO_ERR;
+    }
+
+    if (opts->json_output) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+    }
+    cJSON_Delete(resp);
+    return ret;
+}
+
 static int cmd_targets(cli_opts_t *opts, int do_ping) {
     const char *tf = find_targets_file(opts->targets_file);
     if (!tf) { fprintf(stderr, "No targets config found\n"); return EXIT_CLIENT_ERR; }
@@ -517,6 +633,7 @@ int main(int argc, char *argv[]) {
                        "Subcommands:\n"
                        "  exec <cmd>                  Run a command on the remote host\n"
                        "  put  <local> <remote>       Transfer a file to the remote host\n"
+                       "  get  <remote> <local>       Retrieve a file from the remote host\n"
                        "  ping                        Check if the daemon is alive\n"
                        "  targets                     List configured targets\n"
                        "Options:\n"
@@ -572,6 +689,12 @@ int main(int argc, char *argv[]) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
         rc = cmd_put(&opts, argv[optind], argv[optind + 1]);
+    } else if (!strcmp(subcmd, "get")) {
+        if (optind + 1 >= argc) {
+            fprintf(stderr, "get requires: <remote_path> <local_path>\n");
+            targets_free(all_targets); return EXIT_CLIENT_ERR;
+        }
+        rc = cmd_get(&opts, argv[optind], argv[optind + 1]);
     } else if (!strcmp(subcmd, "targets")) {
         rc = cmd_targets(&opts, do_ping_targets);
     } else {

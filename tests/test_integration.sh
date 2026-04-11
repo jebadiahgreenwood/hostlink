@@ -3,8 +3,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CLI="./build/hostlink-cli"
-DAEMON="./build/hostlinkd"
+CLI="./build2/hostlink-cli"
+DAEMON="./build2/hostlinkd"
 SOCK="/tmp/hl_test_$$.sock"
 TCP_PORT=$((19000 + (RANDOM % 1000)))
 TOKEN="integration-test-token-xyz"
@@ -241,6 +241,53 @@ if [ -n "$fpath_out" ] && [ -f "$fpath_out" ]; then
 else
     assert "test_exec_output_to_file_cleanup_path" 1
 fi
+
+
+# ---- test_get_small_text ----
+echo "hello from get" > /tmp/hl_get_test_src_$$.txt
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get "/tmp/hl_get_test_src_$$.txt" "/tmp/hl_get_test_dst_$$.txt" 2>/dev/null)
+st=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])" 2>/dev/null || echo "ERR")
+assert_eq "test_get_small_text_status" "$st" "ok"
+content=$(cat /tmp/hl_get_test_dst_$$.txt 2>/dev/null || echo "ERR")
+assert_eq "test_get_small_text_content" "$content" "hello from get"
+rm -f /tmp/hl_get_test_src_$$.txt /tmp/hl_get_test_dst_$$.txt
+
+# ---- test_get_binary ----
+dd if=/dev/urandom of=/tmp/hl_get_bin_src_$$.bin bs=1024 count=64 2>/dev/null
+src_sha=$(sha256sum /tmp/hl_get_bin_src_$$.bin | awk '{print $1}')
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get "/tmp/hl_get_bin_src_$$.bin" "/tmp/hl_get_bin_dst_$$.bin" 2>/dev/null)
+st=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])" 2>/dev/null || echo "ERR")
+assert_eq "test_get_binary_status" "$st" "ok"
+dst_sha=$(sha256sum /tmp/hl_get_bin_dst_$$.bin 2>/dev/null | awk '{print $1}' || echo "ERR")
+assert_eq "test_get_binary_sha256" "$dst_sha" "$src_sha"
+rm -f /tmp/hl_get_bin_src_$$.bin /tmp/hl_get_bin_dst_$$.bin
+
+# ---- test_get_nonexistent ----
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get "/tmp/nonexistent_file_xyz_$$.txt" "/tmp/hl_get_noexist_$$.txt" 2>/dev/null)
+st=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])" 2>/dev/null || echo "ERR")
+assert_eq "test_get_nonexistent" "$st" "error"
+assert "test_get_nonexistent_no_local" "$([ ! -f /tmp/hl_get_noexist_$$.txt ] && echo 0 || echo 1)"
+
+# ---- test_get_empty_file ----
+touch /tmp/hl_get_empty_src_$$.txt
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get "/tmp/hl_get_empty_src_$$.txt" "/tmp/hl_get_empty_dst_$$.txt" 2>/dev/null)
+st=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])" 2>/dev/null || echo "ERR")
+assert_eq "test_get_empty_file_status" "$st" "ok"
+fsize=$(stat -c%s /tmp/hl_get_empty_dst_$$.txt 2>/dev/null || echo "-1")
+assert_eq "test_get_empty_file_size" "$fsize" "0"
+rm -f /tmp/hl_get_empty_src_$$.txt /tmp/hl_get_empty_dst_$$.txt
+
+# ---- test_get_json_fields ----
+echo "json test" > /tmp/hl_get_json_src_$$.txt
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get "/tmp/hl_get_json_src_$$.txt" "/tmp/hl_get_json_dst_$$.txt" 2>/dev/null)
+has_fields=$(echo "$out" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+required = ['version','id','node','status','path','size','content']
+print(all(k in d for k in required))
+" 2>/dev/null || echo "False")
+assert_eq "test_get_json_fields" "$has_fields" "True"
+rm -f /tmp/hl_get_json_src_$$.txt /tmp/hl_get_json_dst_$$.txt
 
 # ---- test_exec_no_truncation_flag ----
 out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "echo hi" 2>/dev/null)
