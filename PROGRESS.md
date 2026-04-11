@@ -76,3 +76,35 @@ git push origin main
 - executor.c: child calls setpgrp() so kill(-pgid) works on timeout
 - server.c: SIGHUP hot-reloads auth_token, max_concurrent, timeouts, output limits, log_level
 - All 35+ integration test cases from spec §9.2 implemented
+
+---
+
+## v1.1.0 — 2026-04-11 ✅
+
+### New Features
+- **`put` subcommand** — binary-safe file transfer (container→host or container→spark)
+  - base64-encodes locally, sends as HLNK `put` frame, daemon decodes and writes
+  - `--mkdir` creates parent directories; `--mode <octal>` sets permissions
+  - `hl-put` wrapper added to `bin/` for ergonomic use
+- **`--detach` exec flag** — fire-and-forget command execution
+  - daemon double-forks: intermediate calls setsid(), grandchild adopted by init
+  - returns in <100ms regardless of command duration
+  - useful for starting background servers, long-running jobs
+- **`hl_b64_encode/decode`** — RFC 4648 base64 in util.c/h (no line wrapping)
+
+### Tests
+- 8/8 live tests passed: basic put, mkdir, binary integrity, content verify,
+  detach timing, detach execution, hl-put wrapper
+
+### Deployment Notes
+- Host (ramboot): compiled on host (glibc 2.38), installed to /usr/local/bin/
+- Container: compiled inside container (glibc 2.36), installed to bin/hostlink
+- Spark (aarch64): bootstrapped via HTTP relay (exec+detach trick → wget over 10GbE)
+  - Two-step: `hl --detach exec "python3 -m http.server PORT --bind 10.0.0.1"`
+              then `hl-spark "wget http://10.0.0.1:PORT/file"`
+- Future: add `make cross-compile` target for clean multi-arch builds (#13 in OPTIMIZE_ENVIRONMENT.md)
+
+### Known Friction Points Added (OPTIMIZE_ENVIRONMENT.md)
+- #11: `hl-put` impractical for files >50MB (single-frame, in-memory base64)
+- #12: `hl-get` missing (host→container direction)
+- #13: Cross-compilation needed for clean multi-arch deploy
