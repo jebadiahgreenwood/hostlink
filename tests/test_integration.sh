@@ -363,17 +363,17 @@ assert_eq "test_json_output_fields" "$has_fields" "True"
 "$CLI" -s "$SOCK" -k "$TOKEN" exec "true" >/dev/null 2>&1
 assert_eq "test_exit_code_0" "$?" "0"
 
-"$CLI" -s "$SOCK" -k "$TOKEN" exec "false" >/dev/null 2>&1 || true
-assert_eq "test_exit_code_1" "$?" "1"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "false" >/dev/null 2>&1; _ec=$?
+assert_eq "test_exit_code_1" "$_ec" "1"
 
-"$CLI" -s /nonexistent_xyz.sock -k "$TOKEN" exec "echo hi" >/dev/null 2>&1 || true
-assert_eq "test_exit_code_2" "$?" "2"
+"$CLI" -s /nonexistent_xyz.sock -k "$TOKEN" exec "echo hi" >/dev/null 2>&1; _ec=$?
+assert_eq "test_exit_code_2" "$_ec" "2"
 
-"$CLI" -s "$SOCK" -k "badtoken" exec "echo hi" >/dev/null 2>&1 || true
-assert_eq "test_exit_code_3" "$?" "3"
+"$CLI" -s "$SOCK" -k "badtoken" exec "echo hi" >/dev/null 2>&1; _ec=$?
+assert_eq "test_exit_code_3" "$_ec" "3"
 
-"$CLI" -s "$SOCK" -k "$TOKEN" -T 500 exec "sleep 60" >/dev/null 2>&1 || true
-assert_eq "test_exit_code_5" "$?" "5"
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 500 exec "sleep 60" >/dev/null 2>&1; _ec=$?
+assert_eq "test_exit_code_5" "$_ec" "5"
 
 # ---- test_graceful_shutdown ----
 # Start a long command, send SIGTERM to daemon, verify it stops within ~5s
@@ -401,7 +401,7 @@ wait "$long_pid" 2>/dev/null || true
 # ---- test_connect_timeout ----
 # Daemon is now stopped
 t_start=$(date +%s%3N)
-"$CLI" -s "$SOCK" -k "$TOKEN" -C 500 exec "echo hi" >/dev/null 2>&1 || true
+"$CLI" -s "$SOCK" -k "$TOKEN" -C 500 exec "echo hi" >/dev/null 2>&1
 cli_ec=$?
 t_end=$(date +%s%3N)
 elapsed=$((t_end - t_start))
@@ -410,7 +410,7 @@ assert_eq "test_connect_timeout_exit_code" "$cli_ec" "2"
 
 # ---- test_connect_timeout_default ----
 t_start=$(date +%s%3N)
-"$CLI" -s "$SOCK" -k "$TOKEN" exec "echo hi" >/dev/null 2>&1 || true
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "echo hi" >/dev/null 2>&1
 cli_ec=$?
 t_end=$(date +%s%3N)
 elapsed=$((t_end - t_start))

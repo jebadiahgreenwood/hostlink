@@ -110,6 +110,36 @@ static void write_pidfile(const char *path) {
     fclose(f);
 }
 
+/* Check if another instance is already running via PID file.
+ * Returns 1 if a live process exists, 0 if safe to start.
+ * Removes stale PID files (process dead but file remains). */
+static int check_existing_instance(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;  /* no PID file — safe to start */
+    pid_t existing_pid = 0;
+    (void)fscanf(f, "%d", &existing_pid);
+    fclose(f);
+    if (existing_pid <= 0) { unlink(path); return 0; }
+    /* Check if the process is alive by sending signal 0 */
+    if (kill(existing_pid, 0) == 0) {
+        /* Process exists — check it's actually hostlinkd, not a recycled PID */
+        char proc_comm[256] = {0};
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)existing_pid);
+        FILE *cf = fopen(comm_path, "r");
+        if (cf) { (void)fscanf(cf, "%255s", proc_comm); fclose(cf); }
+        if (strstr(proc_comm, "hostlinkd") != NULL) {
+            fprintf(stderr, "ERROR: hostlinkd is already running (pid %d).\n"
+                            "       Use 'kill %d' or 'systemctl restart hostlinkd' to restart.\n",
+                    (int)existing_pid, (int)existing_pid);
+            return 1;
+        }
+    }
+    /* Stale PID file — process is dead */
+    unlink(path);
+    return 0;
+}
+
 static void drop_privileges(const char *username) {
     if (!username || username[0] == '\0') return;
     if (getuid() != 0) return;
@@ -191,6 +221,9 @@ int main(int argc, char *argv[]) {
 
     const char *log_file = (log_tgt == LOG_TARGET_FILE) ? cfg.log_target : NULL;
     log_init(log_tgt, log_lvl, log_file);
+
+    /* Refuse to start if another instance is already running */
+    if (check_existing_instance(PID_FILE) != 0) { return 1; }
 
     int unix_fd = -1, tcp_fd = -1;
     if (cfg.unix_enabled) {
