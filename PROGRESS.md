@@ -108,3 +108,40 @@ git push origin main
 - #11: `hl-put` impractical for files >50MB (single-frame, in-memory base64)
 - #12: `hl-get` missing (host→container direction)
 - #13: Cross-compilation needed for clean multi-arch deploy
+
+---
+
+## v1.2.0 — 2026-04-11 ✅
+
+### New Feature: `get` subcommand
+- **`get <remote_path> <local_path>`** — binary-safe file retrieval (daemon→client)
+  - Daemon reads file, base64-encodes, sends as HLNK `get` response frame
+  - 90 MiB max file size (fits under 128 MiB frame limit after base64 overhead)
+  - Error responses for missing, unreadable, and oversized files
+  - Client decodes base64, writes to local path
+  - `-j` mode: writes file AND prints JSON (unlike other subcommands where -j replaces output)
+  - `hl-get` wrapper added to `bin/` for ergonomic use
+
+### Deployment
+- **Host (ramboot):** v1.2.0 compiled, installed, daemon restarted via systemd ✅
+- **Container:** v1.2.0 compiled, installed to `bin/hostlink` ✅
+- **Spark (aarch64):** v1.2.0 compiled and binary installed ⚠️ **Daemon needs manual restart**
+  - Binary at `/usr/local/bin/hostlinkd` is updated
+  - Run on Spark: `systemctl restart hostlinkd`
+
+### Tests
+- 5 new integration tests: text get, binary SHA256 verify, nonexistent file, empty file, JSON field validation
+- **67/67 integration tests pass** (62 existing + 5 new)
+
+### Bug Fixes
+- `hl-spark` wrapper: `put|get` case was hardcoding `put` subcommand for both — fixed to use `$subcmd`
+- `fscanf` return value warnings on host GCC (stricter `-Werror=unused-result`)
+
+### Usage
+```bash
+# From container:
+hl-get /etc/hostname /tmp/host-hostname.txt
+hl-get -t spark /root/results.json /tmp/results.json
+hl-spark get /root/model.safetensors /tmp/model.safetensors
+hl get /var/log/syslog /tmp/syslog.txt
+```
