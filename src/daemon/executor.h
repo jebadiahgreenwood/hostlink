@@ -18,6 +18,7 @@ typedef struct {
     int    output_to_file;
     char   output_tmpdir[256];
     char   shell[256];
+    int    detach;   /* 1 = double-fork, return immediately, no output captured */
 
     /* outputs */
     char  *stdout_buf;
@@ -37,7 +38,9 @@ typedef struct {
     int    exec_error;  /* 1 if we couldn't even start */
 } exec_result_t;
 
-/* Execute a command synchronously (blocking). Fills exec_result_t. */
+/* Execute a command synchronously (blocking). Fills exec_result_t.
+   If r->detach is set, double-forks the child and returns immediately
+   with exit_code=0 once the grandchild is confirmed launched. */
 void executor_run(exec_result_t *r);
 
 /* Free buffers in exec_result_t */

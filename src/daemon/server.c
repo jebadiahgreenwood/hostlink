@@ -10,6 +10,7 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -28,12 +29,6 @@ static volatile int     g_running    = 1;
 static volatile int     g_reload     = 0;
 static long long         g_start_time = 0;
 
-/*
- * g_active_children tracks how many worker children are currently running.
- * It is incremented BEFORE fork() in the parent (so the busy check is
- * accurate even when multiple connections arrive before any child exits),
- * and decremented when SIGCHLD fires via waitpid() in the event loop.
- */
 static int g_active_children = 0;
 #define MAX_WORKERS 256
 static pid_t g_worker_pids[MAX_WORKERS];
@@ -94,9 +89,124 @@ static void handle_ping(int fd, cJSON *req) {
 }
 
 /*
+ * handle_put: write a file to the host from base64-encoded content.
+ * Request fields:
+ *   path    (string) — absolute destination path on the host
+ *   content (string) — base64-encoded file bytes
+ *   mode    (number, optional) — file permissions, default 0644
+ *   mkdir   (bool, optional)   — create parent directories if needed
+ */
+static void handle_put(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j;
+    j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    /* path */
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "put: path is required");
+        return;
+    }
+    const char *dest_path = j->valuestring;
+
+    /* content (base64) */
+    j = cJSON_GetObjectItem(req, "content");
+    if (!cJSON_IsString(j)) {
+        send_error(fd, req_id, "bad_request", "put: content (base64) is required");
+        return;
+    }
+    const char *b64 = j->valuestring;
+    size_t b64_len  = strlen(b64);
+
+    /* mode */
+    mode_t file_mode = 0644;
+    j = cJSON_GetObjectItem(req, "mode");
+    if (cJSON_IsNumber(j) && j->valueint > 0)
+        file_mode = (mode_t)j->valueint;
+
+    /* mkdir */
+    int do_mkdir = 0;
+    j = cJSON_GetObjectItem(req, "mkdir");
+    if (cJSON_IsTrue(j)) do_mkdir = 1;
+
+    /* Decode base64 */
+    size_t max_decoded = hl_b64_decoded_len(b64, b64_len) + 4;
+    unsigned char *data = malloc(max_decoded);
+    if (!data) {
+        send_error(fd, req_id, "error", "put: out of memory");
+        return;
+    }
+    ssize_t data_len = hl_b64_decode(b64, b64_len, data, max_decoded);
+    if (data_len < 0) {
+        free(data);
+        send_error(fd, req_id, "bad_request", "put: invalid base64 content");
+        return;
+    }
+
+    /* mkdir -p on parent if requested */
+    if (do_mkdir) {
+        char *path_copy = strdup(dest_path);
+        if (path_copy) {
+            char *slash = strrchr(path_copy, '/');
+            if (slash && slash != path_copy) {
+                *slash = '\0';
+                /* Walk and create each component */
+                char tmp[512];
+                snprintf(tmp, sizeof(tmp), "%s", path_copy);
+                for (char *p = tmp + 1; *p; p++) {
+                    if (*p == '/') {
+                        *p = '\0';
+                        mkdir(tmp, 0755);
+                        *p = '/';
+                    }
+                }
+                mkdir(tmp, 0755);
+            }
+            free(path_copy);
+        }
+    }
+
+    /* Write file */
+    int wfd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, file_mode);
+    if (wfd < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "put: cannot open %s: %s", dest_path, strerror(errno));
+        free(data);
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    ssize_t written = 0;
+    while (written < data_len) {
+        ssize_t n = write(wfd, data + written, (size_t)(data_len - written));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(wfd);
+            free(data);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "put: write error: %s", strerror(errno));
+            send_error(fd, req_id, "error", msg);
+            return;
+        }
+        written += n;
+    }
+    close(wfd);
+    free(data);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version",       1);
+    cJSON_AddStringToObject(resp, "id",            req_id);
+    cJSON_AddStringToObject(resp, "node",          g_cfg->node_name);
+    cJSON_AddStringToObject(resp, "status",        "ok");
+    cJSON_AddStringToObject(resp, "path",          dest_path);
+    cJSON_AddNumberToObject(resp, "bytes_written", (double)written);
+    frame_send_json(fd, resp);
+    cJSON_Delete(resp);
+}
+
+/*
  * handle_exec: runs in a forked worker child.
- * The parent has already incremented g_active_children and will decrement
- * it via SIGCHLD/waitpid when the child exits.
  */
 static void handle_exec(int fd, cJSON *req) {
     const char *req_id = "";
@@ -113,10 +223,10 @@ static void handle_exec(int fd, cJSON *req) {
 
     exec_result_t r;
     memset(&r, 0, sizeof(r));
-    snprintf(r.request_id, sizeof(r.request_id), "%s", req_id);
-    snprintf(r.command,    sizeof(r.command),    "%s", cmd_j->valuestring);
-    snprintf(r.shell,      sizeof(r.shell),      "%s", g_cfg->shell);
-    snprintf(r.output_tmpdir, sizeof(r.output_tmpdir), "%s", g_cfg->output_tmpdir);
+    snprintf(r.request_id,    sizeof(r.request_id),    "%s", req_id);
+    snprintf(r.command,       sizeof(r.command),        "%s", cmd_j->valuestring);
+    snprintf(r.shell,         sizeof(r.shell),          "%s", g_cfg->shell);
+    snprintf(r.output_tmpdir, sizeof(r.output_tmpdir),  "%s", g_cfg->output_tmpdir);
 
     j = cJSON_GetObjectItem(req, "workdir");
     if (cJSON_IsString(j)) snprintf(r.workdir, sizeof(r.workdir), "%s", j->valuestring);
@@ -125,6 +235,10 @@ static void handle_exec(int fd, cJSON *req) {
     r.timeout_ms = (cJSON_IsNumber(j) && j->valueint > 0)
                    ? j->valueint : g_cfg->default_timeout_ms;
     if (r.timeout_ms > g_cfg->max_timeout_ms) r.timeout_ms = g_cfg->max_timeout_ms;
+
+    /* detach flag */
+    j = cJSON_GetObjectItem(req, "detach");
+    r.detach = cJSON_IsTrue(j) ? 1 : 0;
 
     long long eff_max = g_cfg->default_max_output_bytes;
     j = cJSON_GetObjectItem(req, "max_stdout_bytes");
@@ -176,41 +290,27 @@ static void handle_exec(int fd, cJSON *req) {
         cJSON_AddNumberToObject(resp, "exit_code", r.exit_code);
     }
 
-    if (r.output_to_file) {
+    if (r.detach) {
+        cJSON_AddTrueToObject(resp, "detached");
+    } else if (r.output_to_file) {
         cJSON_AddStringToObject(resp, "stdout_file", r.stdout_file);
         cJSON_AddStringToObject(resp, "stderr_file", r.stderr_file);
     } else {
         cJSON_AddStringToObject(resp, "stdout", r.stdout_buf ? r.stdout_buf : "");
         cJSON_AddStringToObject(resp, "stderr", r.stderr_buf ? r.stderr_buf : "");
     }
-    cJSON_AddBoolToObject(resp,   "stdout_truncated",        r.stdout_truncated);
-    cJSON_AddBoolToObject(resp,   "stderr_truncated",        r.stderr_truncated);
-    cJSON_AddNumberToObject(resp, "stdout_original_bytes",   (double)r.stdout_original_bytes);
-    cJSON_AddNumberToObject(resp, "stderr_original_bytes",   (double)r.stderr_original_bytes);
-    cJSON_AddNumberToObject(resp, "duration_ms",             (double)r.duration_ms);
+    cJSON_AddBoolToObject(resp,   "stdout_truncated",      r.stdout_truncated);
+    cJSON_AddBoolToObject(resp,   "stderr_truncated",      r.stderr_truncated);
+    cJSON_AddNumberToObject(resp, "stdout_original_bytes", (double)r.stdout_original_bytes);
+    cJSON_AddNumberToObject(resp, "stderr_original_bytes", (double)r.stderr_original_bytes);
+    cJSON_AddNumberToObject(resp, "duration_ms",           (double)r.duration_ms);
 
     frame_send_json(fd, resp);
     cJSON_Delete(resp);
     executor_free(&r);
 }
 
-
-/*
- * dispatch_connection: accept + route.
- *
- * For exec requests we want true concurrency: fork a worker child that
- * handles the request, while the parent immediately returns to epoll.
- * g_active_children is incremented in the parent BEFORE fork so that
- * subsequent connections see the correct count even before any child exits.
- *
- * For ping we handle inline (cheap, non-blocking).
- */
 static void dispatch_connection(int client_fd) {
-    /* Peek at the request type without fully parsing, to decide fork vs inline.
-     * Simple approach: always fork for exec, handle ping inline.
-     * We do a full parse in handle_client in both paths — that's fine. */
-
-    /* Read the frame first to decide */
     char *payload = NULL;
     ssize_t n = frame_recv(client_fd, &payload);
     if (n <= 0) {
@@ -243,17 +343,32 @@ static void dispatch_connection(int client_fd) {
     const char *type = cJSON_IsString(type_j) ? type_j->valuestring : "";
 
     if (!strcmp(type, "ping")) {
-        /* Inline — cheap */
         handle_ping(client_fd, req);
         cJSON_Delete(req);
         close(client_fd);
         return;
     }
 
+    /* put: inline, no fork needed (I/O bound not CPU bound, short-lived) */
+    if (!strcmp(type, "put")) {
+        handle_put(client_fd, req);
+        cJSON_Delete(req);
+        close(client_fd);
+        return;
+    }
+
     if (!strcmp(type, "exec")) {
-        /* Check concurrency limit BEFORE forking */
-        cJSON *id_j  = cJSON_GetObjectItem(req, "id");
+        cJSON *id_j = cJSON_GetObjectItem(req, "id");
         const char *req_id = cJSON_IsString(id_j) ? id_j->valuestring : "";
+
+        /* detach: lightweight double-fork, no output, no concurrency slot needed */
+        cJSON *detach_j = cJSON_GetObjectItem(req, "detach");
+        if (cJSON_IsTrue(detach_j)) {
+            handle_exec(client_fd, req);
+            cJSON_Delete(req);
+            close(client_fd);
+            return;
+        }
 
         if (g_active_children >= g_cfg->max_concurrent) {
             send_error(client_fd, req_id, "error",
@@ -263,9 +378,7 @@ static void dispatch_connection(int client_fd) {
             return;
         }
 
-        /* Increment before fork — parent sees accurate count immediately */
         g_active_children++;
-
         pid_t pid = fork();
         if (pid < 0) {
             g_active_children--;
@@ -276,17 +389,12 @@ static void dispatch_connection(int client_fd) {
         }
 
         if (pid == 0) {
-            /* Worker child */
-            /* Close listen fds inherited from parent */
-            /* (They're CLOEXEC so exec'd children don't get them, but
-               we close explicitly in the worker to be tidy.) */
             handle_exec(client_fd, req);
             cJSON_Delete(req);
             close(client_fd);
             _exit(0);
         }
 
-        /* Parent: worker is running, return to epoll */
         track_worker(pid);
         cJSON_Delete(req);
         close(client_fd);
@@ -380,7 +488,6 @@ int server_run(daemon_config_t *cfg, int unix_fd, int tcp_fd,
                     log_debug("accepted connection on %s",
                               efd == unix_fd ? "unix" : "tcp");
                     dispatch_connection(client_fd);
-                    /* client_fd closed inside dispatch_connection */
                 }
             }
         }
@@ -410,15 +517,12 @@ int server_run(daemon_config_t *cfg, int unix_fd, int tcp_fd,
         }
     }
 
-    /* Graceful shutdown: send SIGTERM to all worker children, then wait up to
-       2s for them to finish, then SIGKILL any stragglers. */
     if (g_active_children > 0) {
         log_info("sending SIGTERM to %d in-flight workers", g_active_children);
-        kill_all_workers(SIGTERM);  /* kill tracked worker children by PID */
-        /* Wait up to 2s */
+        kill_all_workers(SIGTERM);
         int waited = 0;
         while (g_active_children > 0 && waited < 20) {
-            struct timespec ts = {0, 100000000L}; /* 100ms */
+            struct timespec ts = {0, 100000000L};
             nanosleep(&ts, NULL);
             int status;
             pid_t wpid;
