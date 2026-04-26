@@ -17,7 +17,8 @@ typedef struct {
     char   tcp_bind[64];
     int    tcp_port;
 
-    int    max_concurrent;
+    int    max_concurrent;       /* exec workers (forked, one per command)            */
+    int    max_concurrent_io;    /* I/O workers (forked, one per get/put transfer)    */
     int    default_timeout_ms;
     int    max_timeout_ms;
     char   shell[256];

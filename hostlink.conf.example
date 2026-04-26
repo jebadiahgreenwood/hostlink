@@ -23,7 +23,11 @@ tcp_bind = 10.0.0.1
 tcp_port = 9876
 
 # --- Execution limits ---
+# max_concurrent: max forked exec workers (one per `exec` command).
+# max_concurrent_io: max forked I/O workers (one per `get`/`put` transfer).
+# Independent budgets so heavy exec load can't starve transfers and vice versa.
 max_concurrent = 8
+max_concurrent_io = 4
 default_timeout_ms = 30000
 max_timeout_ms = 300000
 shell = /bin/sh

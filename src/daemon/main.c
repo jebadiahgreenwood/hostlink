@@ -27,6 +27,7 @@
 static void usage(void) {
     printf("Usage: hostlinkd [OPTIONS]\n"
            "  -c, --config <path>  Config file (default: " DEFAULT_CONFIG ")\n"
+           "  -p, --pid-file <path>  PID file (default: " PID_FILE ")\n"
            "  -f, --foreground     Run in foreground\n"
            "  -v, --verbose        Increase verbosity (repeatable)\n"
            "  -h, --help           Show help\n"
@@ -177,11 +178,13 @@ static void daemonize(void) {
 
 int main(int argc, char *argv[]) {
     const char *config_path = DEFAULT_CONFIG;
+    const char *pid_path    = PID_FILE;   /* override with -p / --pid-file */
     int foreground = 0;
     int verbosity  = 0;
 
     static struct option long_opts[] = {
         {"config",     required_argument, NULL, 'c'},
+        {"pid-file",   required_argument, NULL, 'p'},
         {"foreground", no_argument,       NULL, 'f'},
         {"verbose",    no_argument,       NULL, 'v'},
         {"help",       no_argument,       NULL, 'h'},
@@ -189,9 +192,10 @@ int main(int argc, char *argv[]) {
         {NULL, 0, NULL, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:fvhV", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:p:fvhV", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c': config_path = optarg; break;
+            case 'p': pid_path    = optarg; break;
             case 'f': foreground  = 1;      break;
             case 'v': verbosity++;           break;
             case 'h': usage(); return 0;
@@ -223,7 +227,7 @@ int main(int argc, char *argv[]) {
     log_init(log_tgt, log_lvl, log_file);
 
     /* Refuse to start if another instance is already running */
-    if (check_existing_instance(PID_FILE) != 0) { return 1; }
+    if (check_existing_instance(pid_path) != 0) { return 1; }
 
     int unix_fd = -1, tcp_fd = -1;
     if (cfg.unix_enabled) {
@@ -244,12 +248,12 @@ int main(int argc, char *argv[]) {
 
     if (!foreground) daemonize();
 
-    write_pidfile(PID_FILE);
+    write_pidfile(pid_path);
 
     int rc = server_run(&cfg, unix_fd, tcp_fd, config_path);
 
     if (cfg.unix_enabled) unlink(cfg.unix_path);
-    unlink(PID_FILE);
+    unlink(pid_path);
     log_close();
     return rc;
 }

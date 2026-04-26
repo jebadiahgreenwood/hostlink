@@ -62,7 +62,8 @@ void daemon_config_defaults(daemon_config_t *cfg) {
     cfg->tcp_enabled   = 0;
     snprintf(cfg->tcp_bind, sizeof(cfg->tcp_bind), "%s", "127.0.0.1");
     cfg->tcp_port      = 9876;
-    cfg->max_concurrent = 8;
+    cfg->max_concurrent    = 8;
+    cfg->max_concurrent_io = 4;   /* default: 4 concurrent get/put transfers */
     cfg->default_timeout_ms = 30000;
     cfg->max_timeout_ms     = 300000;
     snprintf(cfg->shell, sizeof(cfg->shell), "%s", "/bin/sh");
@@ -84,7 +85,8 @@ static void daemon_cfg_cb(const char *section, const char *key,
     STR(tcp_bind) STR(shell) STR(output_tmpdir) STR(log_target) STR(log_level)
     STR(run_as_user)
     BOOL(unix_enabled) BOOL(tcp_enabled) INT(tcp_port)
-    INT(max_concurrent) INT(default_timeout_ms) INT(max_timeout_ms)
+    INT(max_concurrent) INT(max_concurrent_io)
+    INT(default_timeout_ms) INT(max_timeout_ms)
     if (!strcmp(key, "unix_mode")) {
         cfg->unix_mode = (int)strtol(value, NULL, 8); return;
     }

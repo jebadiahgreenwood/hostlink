@@ -30,28 +30,55 @@ static volatile int     g_running    = 1;
 static volatile int     g_reload     = 0;
 static long long         g_start_time = 0;
 
-static int g_active_children = 0;
-#define MAX_WORKERS 256
-static pid_t g_worker_pids[MAX_WORKERS];
-static int   g_worker_count = 0;
+/* Worker tracking — independent budgets for exec vs I/O workers.
+ *
+ * Why two counters: get/put used to run inline on the main event loop, which
+ * head-of-line blocked everything else for the duration of the transfer.
+ * Now each get/put forks like exec, but with its OWN concurrency budget so
+ * a flurry of exec calls can't starve transfers and vice versa.
+ *
+ * SIGCHLD must decrement the right counter, so each tracked PID carries
+ * its worker_type. Single-threaded epoll loop means the array doesn't
+ * need locking. */
+typedef enum {
+    WORKER_EXEC = 1,    /* forked exec worker — bounded by max_concurrent    */
+    WORKER_IO   = 2,    /* forked get/put worker — bounded by max_concurrent_io */
+} worker_type_t;
 
-static void track_worker(pid_t pid) {
-    if (g_worker_count < MAX_WORKERS)
-        g_worker_pids[g_worker_count++] = pid;
+typedef struct {
+    pid_t         pid;
+    worker_type_t type;
+} worker_entry_t;
+
+static int            g_active_children = 0;  /* WORKER_EXEC count */
+static int            g_active_io       = 0;  /* WORKER_IO count   */
+#define MAX_WORKERS 256
+static worker_entry_t g_workers[MAX_WORKERS];
+static int            g_worker_count = 0;
+
+static void track_worker(pid_t pid, worker_type_t type) {
+    if (g_worker_count < MAX_WORKERS) {
+        g_workers[g_worker_count].pid  = pid;
+        g_workers[g_worker_count].type = type;
+        g_worker_count++;
+    }
 }
 
-static void untrack_worker(pid_t pid) {
+/* Remove the entry for `pid`. Returns its type (0 if not found). */
+static worker_type_t untrack_worker(pid_t pid) {
     for (int i = 0; i < g_worker_count; i++) {
-        if (g_worker_pids[i] == pid) {
-            g_worker_pids[i] = g_worker_pids[--g_worker_count];
-            return;
+        if (g_workers[i].pid == pid) {
+            worker_type_t t = g_workers[i].type;
+            g_workers[i] = g_workers[--g_worker_count];
+            return t;
         }
     }
+    return (worker_type_t)0;
 }
 
 static void kill_all_workers(int sig) {
     for (int i = 0; i < g_worker_count; i++)
-        kill(g_worker_pids[i], sig);
+        kill(g_workers[i].pid, sig);
 }
 
 static long long now_s(void) { return (long long)time(NULL); }
@@ -446,19 +473,50 @@ static void dispatch_connection(int client_fd) {
         return;
     }
 
-    /* put: inline, no fork needed (I/O bound not CPU bound, short-lived) */
-    if (!strcmp(type, "put")) {
-        handle_put(client_fd, req);
-        cJSON_Delete(req);
-        close(client_fd);
-        return;
-    }
+    /* get/put: fork an I/O worker so the main event loop stays responsive.
+     * Bounded by max_concurrent_io independently of max_concurrent (exec).
+     *
+     * Pre-refactor these ran inline on the event loop, head-of-line blocking
+     * every other request for the duration of the transfer. With multiple
+     * agents calling hl-get/hl-put, that meant a single multi-MiB transfer
+     * froze the whole daemon. Forking matches the exec model. */
+    if (!strcmp(type, "put") || !strcmp(type, "get")) {
+        cJSON *id_j = cJSON_GetObjectItem(req, "id");
+        const char *req_id = cJSON_IsString(id_j) ? id_j->valuestring : "";
 
-    /* get: inline, no fork needed */
-    if (!strcmp(type, "get")) {
-        handle_get(client_fd, req);
+        if (g_active_io >= g_cfg->max_concurrent_io) {
+            send_error(client_fd, req_id, "error",
+                       "server busy, max concurrent I/O transfers reached");
+            cJSON_Delete(req);
+            close(client_fd);
+            return;
+        }
+
+        g_active_io++;
+        pid_t pid = fork();
+        if (pid < 0) {
+            g_active_io--;
+            send_error(client_fd, req_id, "error", "fork failed");
+            cJSON_Delete(req);
+            close(client_fd);
+            return;
+        }
+
+        if (pid == 0) {
+            /* Child: handle the transfer, then exit. The handler closes
+             * client_fd implicitly via _exit (close-on-exit semantics).
+             * We don't run cJSON_Delete here because _exit reclaims memory. */
+            if (!strcmp(type, "put")) handle_put(client_fd, req);
+            else                       handle_get(client_fd, req);
+            _exit(0);
+        }
+
+        /* Parent: track child, drop the fd, return to epoll. */
+        track_worker(pid, WORKER_IO);
         cJSON_Delete(req);
         close(client_fd);
+        log_debug("forked I/O worker pid=%d type=%s active_io=%d",
+                  (int)pid, type, g_active_io);
         return;
     }
 
@@ -500,10 +558,10 @@ static void dispatch_connection(int client_fd) {
             _exit(0);
         }
 
-        track_worker(pid);
+        track_worker(pid, WORKER_EXEC);
         cJSON_Delete(req);
         close(client_fd);
-        log_debug("forked worker pid=%d active=%d", (int)pid, g_active_children);
+        log_debug("forked exec worker pid=%d active=%d", (int)pid, g_active_children);
         return;
     }
 
@@ -575,10 +633,21 @@ int server_run(daemon_config_t *cfg, int unix_fd, int tcp_fd,
                         int status;
                         pid_t wpid;
                         while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
-                            untrack_worker(wpid);
-                            if (g_active_children > 0) g_active_children--;
-                            log_debug("worker pid=%d exited active=%d",
-                                      (int)wpid, g_active_children);
+                            worker_type_t t = untrack_worker(wpid);
+                            if (t == WORKER_EXEC && g_active_children > 0) {
+                                g_active_children--;
+                                log_debug("exec worker pid=%d exited active=%d",
+                                          (int)wpid, g_active_children);
+                            } else if (t == WORKER_IO && g_active_io > 0) {
+                                g_active_io--;
+                                log_debug("I/O worker pid=%d exited active_io=%d",
+                                          (int)wpid, g_active_io);
+                            } else {
+                                /* Untracked PID — likely a detached double-fork's
+                                 * intermediate child, or a worker exiting after
+                                 * we already decremented in fork-failure path. */
+                                log_debug("untracked child pid=%d reaped", (int)wpid);
+                            }
                         }
                     }
                 }
@@ -604,6 +673,7 @@ int server_run(daemon_config_t *cfg, int unix_fd, int tcp_fd,
                 if (daemon_config_load(config_path, &new_cfg) == 0) {
                     memcpy(g_cfg->auth_token, new_cfg.auth_token, sizeof(g_cfg->auth_token));
                     g_cfg->max_concurrent           = new_cfg.max_concurrent;
+                    g_cfg->max_concurrent_io        = new_cfg.max_concurrent_io;
                     g_cfg->default_timeout_ms       = new_cfg.default_timeout_ms;
                     g_cfg->max_timeout_ms           = new_cfg.max_timeout_ms;
                     g_cfg->default_max_output_bytes = new_cfg.default_max_output_bytes;
@@ -622,21 +692,25 @@ int server_run(daemon_config_t *cfg, int unix_fd, int tcp_fd,
         }
     }
 
-    if (g_active_children > 0) {
-        log_info("sending SIGTERM to %d in-flight workers", g_active_children);
+    if (g_worker_count > 0) {
+        log_info("sending SIGTERM to %d in-flight workers (exec=%d io=%d)",
+                 g_worker_count, g_active_children, g_active_io);
         kill_all_workers(SIGTERM);
         int waited = 0;
-        while (g_active_children > 0 && waited < 20) {
+        while (g_worker_count > 0 && waited < 20) {
             struct timespec ts = {0, 100000000L};
             nanosleep(&ts, NULL);
             int status;
             pid_t wpid;
-            while ((wpid = waitpid(-1, &status, WNOHANG)) > 0)
-                if (g_active_children > 0) g_active_children--;
+            while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
+                worker_type_t t = untrack_worker(wpid);
+                if (t == WORKER_EXEC && g_active_children > 0) g_active_children--;
+                else if (t == WORKER_IO && g_active_io > 0)    g_active_io--;
+            }
             waited++;
         }
-        if (g_active_children > 0) {
-            log_warn("killing %d remaining workers", g_active_children);
+        if (g_worker_count > 0) {
+            log_warn("killing %d remaining workers", g_worker_count);
             kill_all_workers(SIGKILL);
             while (waitpid(-1, NULL, 0) > 0) {}
         }

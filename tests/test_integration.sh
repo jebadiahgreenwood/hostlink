@@ -3,8 +3,15 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CLI="./build2/hostlink-cli"
-DAEMON="./build2/hostlinkd"
+# Prefer fresh build/ (make all output); fall back to committed build2/
+# binaries so the test can run without rebuilding.
+if [ -x ./build/hostlink-cli ] && [ -x ./build/hostlinkd ]; then
+    CLI="./build/hostlink-cli"
+    DAEMON="./build/hostlinkd"
+else
+    CLI="./build2/hostlink-cli"
+    DAEMON="./build2/hostlinkd"
+fi
 SOCK="/tmp/hl_test_$$.sock"
 TCP_PORT=$((19000 + (RANDOM % 1000)))
 TOKEN="integration-test-token-xyz"
@@ -12,6 +19,7 @@ OUTPUT_DIR="/tmp/hl_test_output_$$"
 CONF="/tmp/hl_test_$$.conf"
 CONF2="/tmp/hl_test2_$$.conf"
 TARGETS="/tmp/hl_targets_$$.conf"
+PIDFILE="/tmp/hl_test_$$.pid"
 DAEMON_PID=""
 PASS=0
 FAIL=0
@@ -22,7 +30,7 @@ cleanup() {
         sleep 0.3
         kill -9 "$DAEMON_PID" 2>/dev/null || true
     fi
-    rm -f "$CONF" "$CONF2" "$TARGETS" "$SOCK"
+    rm -f "$CONF" "$CONF2" "$TARGETS" "$SOCK" "$PIDFILE"
     rm -rf "$OUTPUT_DIR"
 }
 trap cleanup EXIT
@@ -63,7 +71,9 @@ EOF
 start_daemon() {
     local conf="${1:-$CONF}"
     mkdir -p "$OUTPUT_DIR"
-    "$DAEMON" -f -c "$conf" &
+    # Use a per-test PID file so we don't collide with a system daemon at
+    # /run/hostlink/hostlink.pid during integration runs.
+    "$DAEMON" -f -c "$conf" -p "$PIDFILE" &
     DAEMON_PID=$!
     # Wait for socket to appear
     for i in $(seq 1 30); do
@@ -183,7 +193,8 @@ log_target = stderr
 log_level = warn
 EOF
 mkdir -p "$OUTPUT_DIR"
-"$DAEMON" -f -c "$CONF_CLAMP" &
+PIDFILE_CLAMP="/tmp/hl_clamped_$$.pid"
+"$DAEMON" -f -c "$CONF_CLAMP" -p "$PIDFILE_CLAMP" &
 DAEMON_PID_CLAMP=$!
 for i in $(seq 1 30); do sleep 0.1; [ -S "$SOCK_CLAMP" ] && break; done
 out=$("$CLI" -s "$SOCK_CLAMP" -k "$TOKEN" -j --max-stdout 67108864 exec "dd if=/dev/zero bs=1024 count=2048 2>/dev/null | tr '\0' 'x'" 2>/dev/null)
@@ -193,7 +204,7 @@ assert_eq "test_exec_max_output_clamped_truncated" "$trunc" "True"
 assert "test_exec_max_output_clamped_len" "$([ "$stdout_len" -le 1048576 ] 2>/dev/null && echo 0 || echo 1)"
 kill "$DAEMON_PID_CLAMP" 2>/dev/null || true
 wait "$DAEMON_PID_CLAMP" 2>/dev/null || true
-rm -f "$SOCK_CLAMP" "$CONF_CLAMP"
+rm -f "$SOCK_CLAMP" "$CONF_CLAMP" "$PIDFILE_CLAMP"
 
 # ---- test_exec_output_to_file ----
 out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -O exec "echo hello" 2>/dev/null)
@@ -566,6 +577,100 @@ assert_eq "test_output_to_file_timeout_status" "$st" "timeout"
 if [ -n "$fpath" ]; then
     assert "test_output_to_file_timeout_file_exists" "$([ -f "$fpath" ] && echo 0 || echo 1)"
 fi
+
+# ============================================================================
+# Concurrency tests — prove get/put no longer head-of-line block the daemon
+# ============================================================================
+#
+# Pre-refactor (commit 1), get/put ran inline on the main event loop, so a
+# multi-MiB transfer froze every other request for its duration. Post-refactor
+# they fork into I/O workers (mirroring exec) bounded by max_concurrent_io.
+#
+# These tests would ALL have failed pre-refactor:
+#   1. ping completes promptly while a 50 MiB get is in flight
+#   2. a small get completes promptly while the big get is in flight
+#   3. exec runs concurrently with get
+#   4. max_concurrent_io is enforced (5th transfer rejected with "busy")
+
+# ---- test_concurrent_ping_during_get ----
+SRC="/tmp/hl_concurrent_src_$$.bin"
+SMALL="/tmp/hl_concurrent_small_$$.txt"
+DST_SLOW="/tmp/hl_concurrent_slow_dst_$$.bin"
+DST_FAST="/tmp/hl_concurrent_fast_dst_$$.bin"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=$SRC bs=1M count=50 status=none" >/dev/null 2>&1
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "echo small > $SMALL" >/dev/null 2>&1
+
+# Kick off a slow 50 MiB get in the background
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 get "$SRC" "$DST_SLOW" >/dev/null 2>&1 &
+SLOW_PID=$!
+sleep 0.05  # let the transfer start
+
+t0=$(date +%s%N)
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 2000 ping 2>/dev/null || echo "{}")
+t1=$(date +%s%N)
+ping_ms=$(( (t1 - t0) / 1000000 ))
+ping_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
+assert_eq "test_concurrent_ping_status" "$ping_status" "ok"
+assert "test_concurrent_ping_fast" "$([ "$ping_ms" -lt 200 ] 2>/dev/null && echo 0 || echo 1)"
+
+# ---- test_concurrent_small_get_during_big_get ----
+t0=$(date +%s%N)
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 2000 get "$SMALL" "$DST_FAST" 2>/dev/null || echo "{}")
+t1=$(date +%s%N)
+small_ms=$(( (t1 - t0) / 1000000 ))
+small_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
+assert_eq "test_concurrent_small_get_status" "$small_status" "ok"
+assert "test_concurrent_small_get_fast" "$([ "$small_ms" -lt 200 ] 2>/dev/null && echo 0 || echo 1)"
+
+# ---- test_concurrent_exec_during_get ----
+t0=$(date +%s%N)
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 2000 exec "echo concurrent" 2>/dev/null || echo "{}")
+t1=$(date +%s%N)
+exec_ms=$(( (t1 - t0) / 1000000 ))
+exec_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
+assert_eq "test_concurrent_exec_status" "$exec_status" "ok"
+assert "test_concurrent_exec_fast" "$([ "$exec_ms" -lt 200 ] 2>/dev/null && echo 0 || echo 1)"
+
+wait "$SLOW_PID"
+slow_rc=$?
+assert "test_concurrent_slow_get_ok" "$([ "$slow_rc" -eq 0 ] && echo 0 || echo 1)"
+src_sha=$(sha256sum "$SRC" 2>/dev/null | awk '{print $1}')
+dst_sha=$(sha256sum "$DST_SLOW" 2>/dev/null | awk '{print $1}')
+assert_eq "test_concurrent_slow_get_sha256" "$dst_sha" "$src_sha"
+
+# ---- test_max_concurrent_io_enforced ----
+# Default max_concurrent_io = 4 (set by daemon_config_defaults). Spawn 5
+# simultaneous gets of a near-cap-size file (89 MiB); at least one must
+# hit the busy path. Race-tolerant: we don't depend on which one loses.
+BIG_SRC="/tmp/hl_concurrent_big_$$.bin"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=$BIG_SRC bs=1M count=89 status=none" >/dev/null 2>&1
+OVERFLOW_OUT_DIR="/tmp/hl_concurrent_overflow_${$}_d"
+mkdir -p "$OVERFLOW_OUT_DIR"
+OVERFLOW_PIDS=()
+for i in 1 2 3 4 5; do
+    ("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 30000 get "$BIG_SRC" \
+        "$OVERFLOW_OUT_DIR/slot_${i}.bin" 2>/dev/null \
+        > "$OVERFLOW_OUT_DIR/slot_${i}.json") &
+    OVERFLOW_PIDS+=($!)
+done
+# Wait for these specific PIDs, NOT bare `wait` — bare `wait` would also
+# block on the long-lived daemon background process started by start_daemon.
+for pid in "${OVERFLOW_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+# Use grep against the literal busy-error string instead of parsing each
+# JSON file — 4 of them are ~124 MiB (full base64 payload) and json.load()
+# of that is unbearably slow.
+busy_count=0
+for i in 1 2 3 4 5; do
+    if grep -q '"server busy' "$OVERFLOW_OUT_DIR/slot_${i}.json" 2>/dev/null; then
+        busy_count=$((busy_count+1))
+    fi
+done
+# At least one must have hit the busy path; otherwise the bound isn't enforced.
+assert "test_max_concurrent_io_overflow" "$([ "$busy_count" -ge 1 ] && echo 0 || echo 1)"
+
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f $SRC $SMALL $BIG_SRC" >/dev/null 2>&1 || true
+rm -rf "$DST_SLOW" "$DST_FAST" "$OVERFLOW_OUT_DIR"
 
 # ---- Summary ----
 echo ""
