@@ -13,9 +13,10 @@
 #include "../common/config.h"
 #include "../common/util.h"
 #include "../common/log.h"
+#include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 
 #define EXIT_OK           0
 #define EXIT_REMOTE_ERR   1
@@ -46,6 +47,7 @@ typedef struct {
     char  put_mode[4];      /* "644" etc — unused, kept for mode parsing */
     int   put_mkdir;        /* --mkdir: create parent dirs on put */
     int   put_mode_val;     /* octal file mode for put */
+    int   stream;           /* --stream: force streaming mode for get/put */
 } cli_opts_t;
 
 static const char *find_targets_file(const char *override) {
@@ -500,6 +502,325 @@ static int cmd_get(cli_opts_t *opts, const char *remote_path, const char *local_
     return ret;
 }
 
+/* ── Streaming get/put ─────────────────────────────────────────────────────
+ *
+ * For files that don't fit in a single 128 MiB frame (90 MiB raw cap on the
+ * legacy path due to base64 inflation). Used for tensor weights and other
+ * multi-GB transfers between the container, host, and Spark.
+ *
+ * See server.c "Streaming get/put" comment block for the wire protocol.
+ * Daemon-side both flows run inside forked I/O workers (commit 1).
+ *
+ * Client guarantees: end-to-end SHA-256 verified before reporting success.
+ * Bounded memory: one HL_STREAM_CHUNK in flight regardless of file size.
+ */
+#define HL_STREAM_CHUNK   (4u * 1024u * 1024u)
+#define HL_STREAM_AUTO_THRESHOLD  (90u * 1024u * 1024u)  /* legacy get/put cap */
+
+static int cmd_get_stream(cli_opts_t *opts, const char *remote_path, const char *local_path) {
+    int fd = open_connection(opts);
+    if (fd < 0) return EXIT_CONN_FAILED;
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "get_stream");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+
+    if (frame_send_json(fd, req) != 0) {
+        cJSON_Delete(req); close(fd);
+        fprintf(stderr, "get_stream: failed to send request\n");
+        return EXIT_CONN_FAILED;
+    }
+    cJSON_Delete(req);
+
+    /* Receive header */
+    char *hdr_buf = NULL;
+    ssize_t hn = frame_recv(fd, &hdr_buf);
+    if (hn <= 0) { free(hdr_buf); close(fd); return EXIT_PROTO_ERR; }
+    cJSON *hdr = cJSON_Parse(hdr_buf);
+    free(hdr_buf);
+    if (!hdr) { close(fd); return EXIT_PROTO_ERR; }
+
+    /* Copy out string fields before cJSON_Delete frees them — they're
+     * referenced later in error/success messages. */
+    char        node[64]    = "";
+    char        err_msg[256] = "";
+    const char *status      = "";
+    double      size_d      = 0;
+    cJSON *jx;
+    jx = cJSON_GetObjectItem(hdr, "status");
+    if (cJSON_IsString(jx)) status = jx->valuestring;
+    jx = cJSON_GetObjectItem(hdr, "node");
+    if (cJSON_IsString(jx)) snprintf(node, sizeof(node), "%s", jx->valuestring);
+    jx = cJSON_GetObjectItem(hdr, "size");
+    if (cJSON_IsNumber(jx)) size_d = jx->valuedouble;
+    jx = cJSON_GetObjectItem(hdr, "error_msg");
+    if (cJSON_IsString(jx)) snprintf(err_msg, sizeof(err_msg), "%s", jx->valuestring);
+
+    if (!strcmp(status, "auth_failed")) {
+        fprintf(stderr, "Authentication failed\n");
+        cJSON_Delete(hdr); close(fd); return EXIT_AUTH_FAILED;
+    }
+    if (strcmp(status, "ok") != 0) {
+        char status_copy[64];
+        snprintf(status_copy, sizeof(status_copy), "%s", status);
+        cJSON_Delete(hdr); close(fd);
+        fprintf(stderr, "[%s] get_stream error: %s\n",
+                node, err_msg[0] ? err_msg : status_copy);
+        return EXIT_REMOTE_ERR;
+    }
+    cJSON_Delete(hdr);
+
+    uint64_t expected = (uint64_t)size_d;
+
+    /* Open local destination */
+    int wfd = open(local_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wfd < 0) {
+        fprintf(stderr, "get_stream: cannot write local file %s: %s\n",
+                local_path, strerror(errno));
+        close(fd);
+        return EXIT_CLIENT_ERR;
+    }
+
+    sha256_ctx_t hctx;
+    sha256_init(&hctx);
+    uint64_t total = 0;
+
+    /* Receive raw chunks until we've got the whole file */
+    while (total < expected) {
+        char *chunk = NULL;
+        ssize_t n = frame_recv(fd, &chunk);
+        if (n <= 0) {
+            free(chunk);
+            fprintf(stderr, "get_stream: chunk recv failed at %llu/%llu bytes\n",
+                    (unsigned long long)total, (unsigned long long)expected);
+            close(wfd); unlink(local_path); close(fd);
+            return EXIT_PROTO_ERR;
+        }
+        if (write_all(wfd, chunk, (size_t)n) != 0) {
+            fprintf(stderr, "get_stream: local write failed: %s\n", strerror(errno));
+            free(chunk); close(wfd); unlink(local_path); close(fd);
+            return EXIT_CLIENT_ERR;
+        }
+        sha256_update(&hctx, chunk, (size_t)n);
+        total += (uint64_t)n;
+        free(chunk);
+    }
+    close(wfd);
+
+    uint8_t digest[SHA256_DIGEST_LEN];
+    char    local_hex[SHA256_HEX_LEN];
+    sha256_final(&hctx, digest);
+    sha256_hex(digest, local_hex);
+
+    /* Receive trailer with daemon's claimed sha256 */
+    char *tail_buf = NULL;
+    ssize_t tn = frame_recv(fd, &tail_buf);
+    close(fd);
+    if (tn <= 0 || !tail_buf) {
+        free(tail_buf); unlink(local_path);
+        fprintf(stderr, "get_stream: trailer recv failed\n");
+        return EXIT_PROTO_ERR;
+    }
+    cJSON *tail = cJSON_Parse(tail_buf);
+    free(tail_buf);
+    const char *server_sha = "";
+    if (tail) {
+        cJSON *sj = cJSON_GetObjectItem(tail, "sha256");
+        if (cJSON_IsString(sj)) server_sha = sj->valuestring;
+    }
+    if (server_sha[0] == '\0' || strcmp(server_sha, local_hex) != 0) {
+        fprintf(stderr, "get_stream: SHA-256 mismatch (server=%s local=%s) — "
+                        "file discarded\n",
+                server_sha[0] ? server_sha : "(none)", local_hex);
+        if (tail) cJSON_Delete(tail);
+        unlink(local_path);
+        return EXIT_PROTO_ERR;
+    }
+    if (tail) cJSON_Delete(tail);
+
+    if (!opts->json_output)
+        fprintf(stderr, "[%s] get_stream ok: %s -> %s (%llu bytes, sha256=%.16s...)\n",
+                node, remote_path, local_path,
+                (unsigned long long)total, local_hex);
+    else
+        printf("{\"status\":\"ok\",\"node\":\"%s\",\"size\":%llu,\"sha256\":\"%s\"}\n",
+               node, (unsigned long long)total, local_hex);
+
+    return EXIT_OK;
+}
+
+static int cmd_put_stream(cli_opts_t *opts, const char *local_path, const char *remote_path) {
+    /* Stat local file for size */
+    struct stat st;
+    if (stat(local_path, &st) < 0) {
+        fprintf(stderr, "put_stream: cannot stat %s: %s\n", local_path, strerror(errno));
+        return EXIT_CLIENT_ERR;
+    }
+    int rfd = open(local_path, O_RDONLY);
+    if (rfd < 0) {
+        fprintf(stderr, "put_stream: cannot open %s: %s\n", local_path, strerror(errno));
+        return EXIT_CLIENT_ERR;
+    }
+
+    int fd = open_connection(opts);
+    if (fd < 0) { close(rfd); return EXIT_CONN_FAILED; }
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "put_stream");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+    cJSON_AddNumberToObject(req, "size",    (double)st.st_size);
+    if (opts->put_mode_val > 0)
+        cJSON_AddNumberToObject(req, "mode",  (double)opts->put_mode_val);
+    if (opts->put_mkdir)
+        cJSON_AddBoolToObject(req, "mkdir", 1);
+
+    if (frame_send_json(fd, req) != 0) {
+        cJSON_Delete(req); close(rfd); close(fd);
+        fprintf(stderr, "put_stream: failed to send request\n");
+        return EXIT_CONN_FAILED;
+    }
+    cJSON_Delete(req);
+
+    /* Receive ready/error response */
+    char *ready_buf = NULL;
+    ssize_t rn = frame_recv(fd, &ready_buf);
+    if (rn <= 0) { free(ready_buf); close(rfd); close(fd); return EXIT_PROTO_ERR; }
+    cJSON *ready = cJSON_Parse(ready_buf);
+    free(ready_buf);
+    if (!ready) { close(rfd); close(fd); return EXIT_PROTO_ERR; }
+
+    /* Copy out string fields before cJSON_Delete frees them. */
+    char        node[64]    = "";
+    char        err_msg[256] = "";
+    const char *status      = "";
+    cJSON *jx;
+    jx = cJSON_GetObjectItem(ready, "status");
+    if (cJSON_IsString(jx)) status = jx->valuestring;
+    jx = cJSON_GetObjectItem(ready, "node");
+    if (cJSON_IsString(jx)) snprintf(node, sizeof(node), "%s", jx->valuestring);
+    jx = cJSON_GetObjectItem(ready, "error_msg");
+    if (cJSON_IsString(jx)) snprintf(err_msg, sizeof(err_msg), "%s", jx->valuestring);
+
+    if (!strcmp(status, "auth_failed")) {
+        fprintf(stderr, "Authentication failed\n");
+        cJSON_Delete(ready); close(rfd); close(fd); return EXIT_AUTH_FAILED;
+    }
+    if (strcmp(status, "ok") != 0) {
+        char status_copy[64];
+        snprintf(status_copy, sizeof(status_copy), "%s", status);
+        cJSON_Delete(ready); close(rfd); close(fd);
+        fprintf(stderr, "[%s] put_stream error: %s\n",
+                node, err_msg[0] ? err_msg : status_copy);
+        return EXIT_REMOTE_ERR;
+    }
+    cJSON_Delete(ready);
+
+    /* Stream chunks */
+    sha256_ctx_t hctx;
+    sha256_init(&hctx);
+
+    uint8_t *buf = malloc(HL_STREAM_CHUNK);
+    if (!buf) { close(rfd); close(fd); return EXIT_CLIENT_ERR; }
+
+    uint64_t total = 0;
+    while (total < (uint64_t)st.st_size) {
+        size_t want = (uint64_t)st.st_size - total;
+        if (want > HL_STREAM_CHUNK) want = HL_STREAM_CHUNK;
+
+        ssize_t got = 0;
+        while ((size_t)got < want) {
+            ssize_t n = read(rfd, buf + got, want - (size_t)got);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                free(buf); close(rfd); close(fd);
+                fprintf(stderr, "put_stream: local read error: %s\n", strerror(errno));
+                return EXIT_CLIENT_ERR;
+            }
+            if (n == 0) break;
+            got += n;
+        }
+        if (got == 0) break;
+
+        if (frame_send(fd, (const char *)buf, (size_t)got) != 0) {
+            free(buf); close(rfd); close(fd);
+            fprintf(stderr, "put_stream: chunk send failed\n");
+            return EXIT_CONN_FAILED;
+        }
+        sha256_update(&hctx, buf, (size_t)got);
+        total += (uint64_t)got;
+    }
+
+    free(buf);
+    close(rfd);
+
+    uint8_t digest[SHA256_DIGEST_LEN];
+    char    local_hex[SHA256_HEX_LEN];
+    sha256_final(&hctx, digest);
+    sha256_hex(digest, local_hex);
+
+    /* Send trailer */
+    cJSON *trailer = cJSON_CreateObject();
+    cJSON_AddNumberToObject(trailer, "version",    1);
+    cJSON_AddStringToObject(trailer, "id",         req_id);
+    cJSON_AddStringToObject(trailer, "sha256",     local_hex);
+    cJSON_AddBoolToObject  (trailer, "stream_end", 1);
+    if (frame_send_json(fd, trailer) != 0) {
+        cJSON_Delete(trailer); close(fd);
+        fprintf(stderr, "put_stream: trailer send failed\n");
+        return EXIT_CONN_FAILED;
+    }
+    cJSON_Delete(trailer);
+
+    /* Receive final daemon ack */
+    char *resp_buf = NULL;
+    ssize_t rrn = frame_recv(fd, &resp_buf);
+    close(fd);
+    if (rrn <= 0 || !resp_buf) { free(resp_buf); return EXIT_PROTO_ERR; }
+    cJSON *resp = cJSON_Parse(resp_buf);
+    free(resp_buf);
+    if (!resp) return EXIT_PROTO_ERR;
+
+    int  ret = EXIT_OK;
+    char resp_status[32]  = "";
+    char resp_msg[256]    = "";
+    char resp_sha[SHA256_HEX_LEN] = "";
+    jx = cJSON_GetObjectItem(resp, "status");
+    if (cJSON_IsString(jx)) snprintf(resp_status, sizeof(resp_status), "%s", jx->valuestring);
+    jx = cJSON_GetObjectItem(resp, "error_msg");
+    if (cJSON_IsString(jx)) snprintf(resp_msg, sizeof(resp_msg), "%s", jx->valuestring);
+    jx = cJSON_GetObjectItem(resp, "sha256");
+    if (cJSON_IsString(jx)) snprintf(resp_sha, sizeof(resp_sha), "%s", jx->valuestring);
+    char *resp_json_str = NULL;
+    if (opts->json_output) resp_json_str = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+
+    if (strcmp(resp_status, "ok") != 0) {
+        fprintf(stderr, "[%s] put_stream error: %s\n",
+                node, resp_msg[0] ? resp_msg : resp_status);
+        ret = EXIT_REMOTE_ERR;
+    } else if (opts->json_output) {
+        if (resp_json_str) printf("%s\n", resp_json_str);
+    } else {
+        fprintf(stderr, "[%s] put_stream ok: %s -> %s (%llu bytes, sha256=%.16s...)\n",
+                node, local_path, remote_path,
+                (unsigned long long)total, resp_sha);
+    }
+    free(resp_json_str);
+    return ret;
+}
+
 static int cmd_targets(cli_opts_t *opts, int do_ping) {
     const char *tf = find_targets_file(opts->targets_file);
     if (!tf) { fprintf(stderr, "No targets config found\n"); return EXIT_CLIENT_ERR; }
@@ -582,6 +903,7 @@ int main(int argc, char *argv[]) {
         {"detach",         no_argument,       NULL, 'D'},   /* NEW: fire-and-forget */
         {"mkdir",          no_argument,       NULL, 1003},  /* NEW: mkdir -p on put */
         {"mode",           required_argument, NULL, 1004},  /* NEW: file mode on put */
+        {"stream",         no_argument,       NULL, 1005},  /* NEW: streaming get/put (no 90 MiB cap) */
         {NULL, 0, NULL, 0}
     };
 
@@ -628,12 +950,15 @@ int main(int argc, char *argv[]) {
             case 'D': opts.detach = 1; break;
             case 1003: opts.put_mkdir = 1; break;
             case 1004: opts.put_mode_val = (int)strtol(optarg, NULL, 8); break;
+            case 1005: opts.stream = 1; break;
             case 'h':
                 printf("Usage: hostlink-cli [OPTIONS] <SUBCOMMAND>\n"
                        "Subcommands:\n"
                        "  exec <cmd>                  Run a command on the remote host\n"
-                       "  put  <local> <remote>       Transfer a file to the remote host\n"
-                       "  get  <remote> <local>       Retrieve a file from the remote host\n"
+                       "  put  <local> <remote>       Transfer a file (auto-streams if > 90 MiB)\n"
+                       "  get  <remote> <local>       Retrieve a file (use --stream for > 90 MiB)\n"
+                       "  put-stream <local> <remote> Force-stream a put (sha256-verified)\n"
+                       "  get-stream <remote> <local> Force-stream a get (sha256-verified)\n"
                        "  ping                        Check if the daemon is alive\n"
                        "  targets                     List configured targets\n"
                        "Options:\n"
@@ -651,6 +976,8 @@ int main(int argc, char *argv[]) {
                        "  -D, --detach   Fire-and-forget: return immediately, no output\n"
                        "  --mkdir        Create parent directories on put\n"
                        "  --mode <oct>   File permissions on put (default 644)\n"
+                       "  --stream       Use streaming protocol (no 90 MiB cap, sha256 verified)\n"
+                       "                 Required for files > ~95 MiB; auto-applied to large puts.\n"
                        "  --targets-file <path>  Override targets config path\n");
                 return EXIT_OK;
             case 'V': printf("hostlink-cli %s\n", VERSION); return EXIT_OK;
@@ -688,13 +1015,43 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "put requires: <local_path> <remote_path>\n");
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        rc = cmd_put(&opts, argv[optind], argv[optind + 1]);
+        const char *local_path = argv[optind];
+        /* Auto-promote large puts to streaming. We can stat the local file
+         * cheaply, so we know the size up-front and avoid forcing the user
+         * to remember --stream for big files. */
+        int use_stream = opts.stream;
+        if (!use_stream) {
+            struct stat lst;
+            if (stat(local_path, &lst) == 0 &&
+                (uint64_t)lst.st_size > HL_STREAM_AUTO_THRESHOLD)
+                use_stream = 1;
+        }
+        rc = use_stream
+             ? cmd_put_stream(&opts, local_path, argv[optind + 1])
+             : cmd_put       (&opts, local_path, argv[optind + 1]);
     } else if (!strcmp(subcmd, "get")) {
         if (optind + 1 >= argc) {
             fprintf(stderr, "get requires: <remote_path> <local_path>\n");
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        rc = cmd_get(&opts, argv[optind], argv[optind + 1]);
+        /* For get we don't know the remote size up-front, so streaming is
+         * opt-in via --stream. The legacy get error message tells the user
+         * to retry with --stream if they hit the 90 MiB cap. */
+        rc = opts.stream
+             ? cmd_get_stream(&opts, argv[optind], argv[optind + 1])
+             : cmd_get       (&opts, argv[optind], argv[optind + 1]);
+    } else if (!strcmp(subcmd, "get-stream") || !strcmp(subcmd, "get_stream")) {
+        if (optind + 1 >= argc) {
+            fprintf(stderr, "get-stream requires: <remote_path> <local_path>\n");
+            targets_free(all_targets); return EXIT_CLIENT_ERR;
+        }
+        rc = cmd_get_stream(&opts, argv[optind], argv[optind + 1]);
+    } else if (!strcmp(subcmd, "put-stream") || !strcmp(subcmd, "put_stream")) {
+        if (optind + 1 >= argc) {
+            fprintf(stderr, "put-stream requires: <local_path> <remote_path>\n");
+            targets_free(all_targets); return EXIT_CLIENT_ERR;
+        }
+        rc = cmd_put_stream(&opts, argv[optind], argv[optind + 1]);
     } else if (!strcmp(subcmd, "targets")) {
         rc = cmd_targets(&opts, do_ping_targets);
     } else {

@@ -18,7 +18,8 @@ COMMON_SRCS := \
 	$(SRCDIR)/common/log.c \
 	$(SRCDIR)/common/util.c \
 	$(SRCDIR)/common/protocol.c \
-	$(SRCDIR)/common/config.c
+	$(SRCDIR)/common/config.c \
+	$(SRCDIR)/common/sha256.c
 
 # Daemon sources
 DAEMON_SRCS := \

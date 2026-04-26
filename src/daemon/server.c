@@ -20,6 +20,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "../common/util.h"
+#include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
 #define MAX_EVENTS 64
@@ -329,6 +330,266 @@ static void handle_get(int fd, cJSON *req) {
     cJSON_Delete(resp);
 }
 
+/* ── Streaming get/put ─────────────────────────────────────────────────────
+ *
+ * Wire protocol (forward-compatible with legacy get/put):
+ *
+ *   get_stream:
+ *     C→D  {type:"get_stream", id, token, path}                     (1 frame, JSON)
+ *     D→C  {status:"ok", id, node, path, size, stream:true}         (1 frame, JSON)
+ *          OR error JSON, then close
+ *     D→C  raw bytes                                                (N frames, binary)
+ *          chunked at HL_STREAM_CHUNK; final chunk may be smaller
+ *     D→C  {status:"ok", id, sha256:"<hex>", stream_end:true}       (1 frame, JSON)
+ *
+ *   put_stream:
+ *     C→D  {type:"put_stream", id, token, path, size, mode?, mkdir?} (1 frame, JSON)
+ *     D→C  {status:"ok", id, node, ready:true}                      (1 frame, JSON)
+ *          OR error JSON, then close
+ *     C→D  raw bytes                                                (N frames, binary)
+ *     C→D  {sha256:"<hex>", stream_end:true}                        (1 frame, JSON)
+ *     D→C  {status:"ok", id, node, sha256:"<hex>", size}            (1 frame, JSON)
+ *          (status="error" if sha256 mismatch or short write)
+ *
+ * Notes:
+ *   - Both flows run inside forked I/O workers (commit 1 fork-per-IO).
+ *   - No size cap beyond available disk + connection lifetime. Tested at 1 GB+.
+ *   - SHA-256 verifies integrity end-to-end. A 4 MiB chunk size keeps memory
+ *     bounded (one chunk in flight), well under HL_MAX_PAYLOAD = 128 MiB. */
+#define HL_STREAM_CHUNK  (4u * 1024u * 1024u)   /* 4 MiB per binary frame */
+
+static void handle_get_stream(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j;
+    j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "get_stream: path is required");
+        return;
+    }
+    const char *src_path = j->valuestring;
+
+    struct stat st;
+    if (stat(src_path, &st) < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "get_stream: cannot open %s: %s", src_path, strerror(errno));
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    int rfd = open(src_path, O_RDONLY);
+    if (rfd < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "get_stream: cannot open %s: %s", src_path, strerror(errno));
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    cJSON *hdr = cJSON_CreateObject();
+    cJSON_AddNumberToObject(hdr, "version", 1);
+    cJSON_AddStringToObject(hdr, "id",      req_id);
+    cJSON_AddStringToObject(hdr, "node",    g_cfg->node_name);
+    cJSON_AddStringToObject(hdr, "status",  "ok");
+    cJSON_AddStringToObject(hdr, "path",    src_path);
+    cJSON_AddNumberToObject(hdr, "size",    (double)st.st_size);
+    cJSON_AddBoolToObject  (hdr, "stream",  1);
+    if (frame_send_json(fd, hdr) != 0) { cJSON_Delete(hdr); close(rfd); return; }
+    cJSON_Delete(hdr);
+
+    sha256_ctx_t hctx;
+    sha256_init(&hctx);
+
+    uint8_t *buf = malloc(HL_STREAM_CHUNK);
+    if (!buf) { log_error("get_stream: out of memory"); close(rfd); return; }
+
+    size_t total_sent = 0;
+    while ((size_t)st.st_size - total_sent > 0) {
+        size_t want = (size_t)st.st_size - total_sent;
+        if (want > HL_STREAM_CHUNK) want = HL_STREAM_CHUNK;
+
+        ssize_t got = 0;
+        while ((size_t)got < want) {
+            ssize_t n = read(rfd, buf + got, want - (size_t)got);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                log_warn("get_stream: read error: %s", strerror(errno));
+                free(buf); close(rfd); return;
+            }
+            if (n == 0) break;   /* unexpected EOF — file shrunk under us */
+            got += n;
+        }
+        if (got == 0) {
+            log_warn("get_stream: EOF before expected size (sent=%zu of %lld)",
+                     total_sent, (long long)st.st_size);
+            break;
+        }
+
+        if (frame_send(fd, (const char *)buf, (size_t)got) != 0) {
+            log_warn("get_stream: frame_send failed (peer disconnected?)");
+            free(buf); close(rfd); return;
+        }
+        sha256_update(&hctx, buf, (size_t)got);
+        total_sent += (size_t)got;
+    }
+
+    free(buf);
+    close(rfd);
+
+    uint8_t digest[SHA256_DIGEST_LEN];
+    char    hex[SHA256_HEX_LEN];
+    sha256_final(&hctx, digest);
+    sha256_hex(digest, hex);
+
+    cJSON *tail = cJSON_CreateObject();
+    cJSON_AddNumberToObject(tail, "version",    1);
+    cJSON_AddStringToObject(tail, "id",         req_id);
+    cJSON_AddStringToObject(tail, "node",       g_cfg->node_name);
+    cJSON_AddStringToObject(tail, "status",     "ok");
+    cJSON_AddStringToObject(tail, "sha256",     hex);
+    cJSON_AddNumberToObject(tail, "size",       (double)total_sent);
+    cJSON_AddBoolToObject  (tail, "stream_end", 1);
+    frame_send_json(fd, tail);
+    cJSON_Delete(tail);
+}
+
+static void handle_put_stream(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j;
+    j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "put_stream: path is required");
+        return;
+    }
+    const char *dest_path = j->valuestring;
+
+    j = cJSON_GetObjectItem(req, "size");
+    if (!cJSON_IsNumber(j) || j->valuedouble < 0) {
+        send_error(fd, req_id, "bad_request", "put_stream: size is required");
+        return;
+    }
+    uint64_t size_bytes = (uint64_t)j->valuedouble;
+
+    mode_t file_mode = 0644;
+    j = cJSON_GetObjectItem(req, "mode");
+    if (cJSON_IsNumber(j) && j->valueint > 0) file_mode = (mode_t)j->valueint;
+
+    int do_mkdir = 0;
+    j = cJSON_GetObjectItem(req, "mkdir");
+    if (cJSON_IsTrue(j)) do_mkdir = 1;
+
+    if (do_mkdir) {
+        char *path_copy = strdup(dest_path);
+        if (path_copy) {
+            char *slash = strrchr(path_copy, '/');
+            if (slash && slash != path_copy) {
+                *slash = '\0';
+                char tmp[512];
+                snprintf(tmp, sizeof(tmp), "%s", path_copy);
+                for (char *p = tmp + 1; *p; p++) {
+                    if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+                }
+                mkdir(tmp, 0755);
+            }
+            free(path_copy);
+        }
+    }
+
+    int wfd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC, file_mode);
+    if (wfd < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "put_stream: cannot open %s: %s", dest_path, strerror(errno));
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    cJSON *ready = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ready, "version", 1);
+    cJSON_AddStringToObject(ready, "id",      req_id);
+    cJSON_AddStringToObject(ready, "node",    g_cfg->node_name);
+    cJSON_AddStringToObject(ready, "status",  "ok");
+    cJSON_AddBoolToObject  (ready, "ready",   1);
+    if (frame_send_json(fd, ready) != 0) {
+        cJSON_Delete(ready); close(wfd); unlink(dest_path); return;
+    }
+    cJSON_Delete(ready);
+
+    sha256_ctx_t hctx;
+    sha256_init(&hctx);
+    uint64_t total_recv = 0;
+
+    while (total_recv < size_bytes) {
+        char *chunk = NULL;
+        ssize_t n = frame_recv(fd, &chunk);
+        if (n <= 0) {
+            free(chunk);
+            log_warn("put_stream: chunk recv failed (n=%zd) at %llu/%llu",
+                     n, (unsigned long long)total_recv, (unsigned long long)size_bytes);
+            close(wfd); unlink(dest_path); return;
+        }
+        if ((uint64_t)n + total_recv > size_bytes) {
+            log_warn("put_stream: chunk overshoots advertised size");
+            free(chunk);
+            close(wfd); unlink(dest_path); return;
+        }
+        if (write_all(wfd, chunk, (size_t)n) != 0) {
+            log_warn("put_stream: write error: %s", strerror(errno));
+            free(chunk); close(wfd); unlink(dest_path); return;
+        }
+        sha256_update(&hctx, chunk, (size_t)n);
+        total_recv += (uint64_t)n;
+        free(chunk);
+    }
+    close(wfd);
+
+    char *trailer_buf = NULL;
+    ssize_t tn = frame_recv(fd, &trailer_buf);
+    if (tn <= 0 || !trailer_buf) {
+        free(trailer_buf);
+        send_error(fd, req_id, "error", "put_stream: missing trailer");
+        unlink(dest_path);
+        return;
+    }
+    cJSON *trailer = cJSON_Parse(trailer_buf);
+    free(trailer_buf);
+    const char *client_sha = "";
+    if (trailer) {
+        cJSON *sj = cJSON_GetObjectItem(trailer, "sha256");
+        if (cJSON_IsString(sj)) client_sha = sj->valuestring;
+    }
+
+    uint8_t digest[SHA256_DIGEST_LEN];
+    char    hex[SHA256_HEX_LEN];
+    sha256_final(&hctx, digest);
+    sha256_hex(digest, hex);
+
+    int sha_ok = (client_sha[0] != '\0' && strcmp(client_sha, hex) == 0);
+    if (!sha_ok) {
+        log_warn("put_stream: sha256 mismatch (client=%s daemon=%s)",
+                 client_sha[0] ? client_sha : "(none)", hex);
+        unlink(dest_path);
+    }
+    if (trailer) cJSON_Delete(trailer);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version", 1);
+    cJSON_AddStringToObject(resp, "id",      req_id);
+    cJSON_AddStringToObject(resp, "node",    g_cfg->node_name);
+    cJSON_AddStringToObject(resp, "status",  sha_ok ? "ok" : "error");
+    cJSON_AddStringToObject(resp, "path",    dest_path);
+    cJSON_AddNumberToObject(resp, "size",    (double)total_recv);
+    cJSON_AddStringToObject(resp, "sha256",  hex);
+    if (!sha_ok)
+        cJSON_AddStringToObject(resp, "error_msg",
+            "put_stream: sha256 mismatch — file discarded");
+    frame_send_json(fd, resp);
+    cJSON_Delete(resp);
+}
+
 /*
  * handle_exec: runs in a forked worker child.
  */
@@ -480,7 +741,8 @@ static void dispatch_connection(int client_fd) {
      * every other request for the duration of the transfer. With multiple
      * agents calling hl-get/hl-put, that meant a single multi-MiB transfer
      * froze the whole daemon. Forking matches the exec model. */
-    if (!strcmp(type, "put") || !strcmp(type, "get")) {
+    if (!strcmp(type, "put")        || !strcmp(type, "get") ||
+        !strcmp(type, "put_stream") || !strcmp(type, "get_stream")) {
         cJSON *id_j = cJSON_GetObjectItem(req, "id");
         const char *req_id = cJSON_IsString(id_j) ? id_j->valuestring : "";
 
@@ -506,8 +768,10 @@ static void dispatch_connection(int client_fd) {
             /* Child: handle the transfer, then exit. The handler closes
              * client_fd implicitly via _exit (close-on-exit semantics).
              * We don't run cJSON_Delete here because _exit reclaims memory. */
-            if (!strcmp(type, "put")) handle_put(client_fd, req);
-            else                       handle_get(client_fd, req);
+            if      (!strcmp(type, "put"))        handle_put       (client_fd, req);
+            else if (!strcmp(type, "get"))        handle_get       (client_fd, req);
+            else if (!strcmp(type, "put_stream")) handle_put_stream(client_fd, req);
+            else                                  handle_get_stream(client_fd, req);
             _exit(0);
         }
 

@@ -672,6 +672,75 @@ assert "test_max_concurrent_io_overflow" "$([ "$busy_count" -ge 1 ] && echo 0 ||
 "$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f $SRC $SMALL $BIG_SRC" >/dev/null 2>&1 || true
 rm -rf "$DST_SLOW" "$DST_FAST" "$OVERFLOW_OUT_DIR"
 
+# ============================================================================
+# Streaming get/put — no size cap, sha256-verified end-to-end (commit 2)
+# ============================================================================
+
+# ---- test_stream_get_small ----
+# A 1 MiB file via get-stream — exercises the streaming path even on small data
+echo "test data $(date)" > /tmp/hl_stream_tiny_$$.txt
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=/tmp/hl_stream_small_src_$$.bin bs=1M count=1 status=none" >/dev/null 2>&1
+src_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_small_src_$$.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stdout','').strip())" 2>/dev/null || echo "")
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 10000 get-stream \
+    /tmp/hl_stream_small_src_$$.bin /tmp/hl_stream_small_dst_$$.bin >/dev/null 2>&1
+get_rc=$?
+dst_sha=$(sha256sum /tmp/hl_stream_small_dst_$$.bin 2>/dev/null | awk '{print $1}')
+assert    "test_stream_get_small_rc"     "$([ "$get_rc" -eq 0 ] && echo 0 || echo 1)"
+assert_eq "test_stream_get_small_sha256" "$dst_sha" "$src_sha"
+
+# ---- test_stream_put_small ----
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 10000 put-stream \
+    /tmp/hl_stream_small_dst_$$.bin /tmp/hl_stream_small_round_$$.bin >/dev/null 2>&1
+put_rc=$?
+round_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_small_round_$$.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stdout','').strip())" 2>/dev/null || echo "")
+assert    "test_stream_put_small_rc"     "$([ "$put_rc" -eq 0 ] && echo 0 || echo 1)"
+assert_eq "test_stream_put_small_sha256" "$round_sha" "$src_sha"
+
+# ---- test_stream_large_get_above_legacy_cap ----
+# 100 MiB file — legacy `get` would reject this (>90 MiB), `get-stream` succeeds.
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=/tmp/hl_stream_big_src_$$.bin bs=1M count=100 status=none" >/dev/null 2>&1
+big_src_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_big_src_$$.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stdout','').strip())" 2>/dev/null || echo "")
+# Legacy get must be rejected. Don't fall back to "{}" on nonzero exit — the
+# CLI prints valid JSON to stdout AND exits nonzero on remote errors, and
+# appending "{}" pollutes the output and breaks json.load.
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 10000 get \
+    /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_dst_legacy_$$.bin 2>/dev/null) || true
+legacy_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
+assert_eq "test_stream_legacy_get_rejected_at_90mib" "$legacy_status" "error"
+# Stream must succeed
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 get-stream \
+    /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_dst_$$.bin >/dev/null 2>&1
+big_dst_sha=$(sha256sum /tmp/hl_stream_big_dst_$$.bin 2>/dev/null | awk '{print $1}')
+assert_eq "test_stream_big_get_sha256" "$big_dst_sha" "$big_src_sha"
+
+# ---- test_stream_put_auto_promote ----
+# `put` (no --stream) on a >90 MiB file must auto-promote; the file lands and
+# matches the source sha256.
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 put \
+    /tmp/hl_stream_big_dst_$$.bin /tmp/hl_stream_big_auto_$$.bin >/dev/null 2>&1
+auto_rc=$?
+auto_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_big_auto_$$.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stdout','').strip())" 2>/dev/null || echo "")
+assert    "test_stream_put_auto_promote_rc"     "$([ "$auto_rc" -eq 0 ] && echo 0 || echo 1)"
+assert_eq "test_stream_put_auto_promote_sha256" "$auto_sha" "$big_src_sha"
+
+# ---- test_stream_get_nonexistent ----
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -T 5000 get-stream \
+    "/tmp/hl_stream_nope_$$.bin" "/tmp/hl_stream_nope_dst_$$.bin" 2>&1 || echo "ERR")
+case "$out" in
+    *"get_stream error"*|*"cannot open"*) PASS=$((PASS+1)); echo "PASS: test_stream_get_nonexistent" ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL: test_stream_get_nonexistent (got: $out)" ;;
+esac
+assert "test_stream_get_nonexistent_no_local" \
+    "$([ ! -f /tmp/hl_stream_nope_dst_$$.bin ] && echo 0 || echo 1)"
+
+# Cleanup
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f /tmp/hl_stream_small_src_$$.bin /tmp/hl_stream_small_round_$$.bin /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_auto_$$.bin /tmp/hl_stream_nope_$$.bin" >/dev/null 2>&1 || true
+rm -f /tmp/hl_stream_tiny_$$.txt /tmp/hl_stream_small_dst_$$.bin /tmp/hl_stream_big_dst_$$.bin /tmp/hl_stream_big_dst_legacy_$$.bin /tmp/hl_stream_nope_dst_$$.bin
+
 # ---- Summary ----
 echo ""
 echo "=== Integration Test Summary ==="
