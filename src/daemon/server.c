@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ftw.h>
 #include "server.h"
 #include "executor.h"
 #include "../common/protocol.h"
@@ -326,6 +327,150 @@ static void handle_get(int fd, cJSON *req) {
     cJSON_AddNumberToObject(resp, "size",    (double)total_read);
     cJSON_AddStringToObject(resp, "content", b64);
     free(b64);
+    frame_send_json(fd, resp);
+    cJSON_Delete(resp);
+}
+
+/* ── get_stat ─────────────────────────────────────────────────────────────
+ *
+ * Probe used by the client `get` dispatcher to learn what's at a remote path
+ * before deciding how to fetch it. Returns:
+ *   - isdir = false: { size }            for a single regular file
+ *   - isdir = true:  { size, files: [{path, size}, ...] }
+ *     where each entry's path is relative to the requested root.
+ *
+ * Walks with FTW_PHYS so symlinks (file or dir) are reported as their link
+ * type and skipped — never followed — to avoid loops and surprise pulls.
+ * Sockets, devices, and FIFOs are skipped silently.
+ *
+ * Caps:
+ *   - HL_GET_STAT_MAX_FILES entries per request — the response would otherwise
+ *     blow past HL_MAX_PAYLOAD on huge trees, and the client UX of pulling a
+ *     million tiny files is bad anyway. Caller gets `truncated=true` in the
+ *     response and an error_msg; they can narrow the path and retry.
+ *
+ * Wire protocol:
+ *   C→D  {type:"get_stat", id, token, path}
+ *   D→C  {status:"ok", id, node, path, isdir, size, [files], [truncated]}
+ *        OR error JSON
+ *
+ * Runs in a forked I/O worker (same dispatch as get/put) so a slow walk of
+ * a network filesystem can't stall the main event loop. */
+#define HL_GET_STAT_MAX_FILES  100000
+
+/* nftw has no user-data argument, so the walk callback reads/writes these.
+ * Safe because each request runs in its own forked I/O worker: globals are
+ * private to that child process. */
+static cJSON      *g_walk_files;
+static const char *g_walk_root;
+static size_t      g_walk_root_len;
+static uint64_t    g_walk_total;
+static int         g_walk_count;
+static int         g_walk_capped;
+
+static int get_stat_walk_cb(const char *fpath, const struct stat *sb,
+                            int typeflag, struct FTW *ftwbuf) {
+    (void)ftwbuf;
+    if (typeflag != FTW_F) return 0;            /* dirs, symlinks, special: skip */
+    if (!S_ISREG(sb->st_mode)) return 0;
+    if (g_walk_count >= HL_GET_STAT_MAX_FILES) {
+        g_walk_capped = 1;
+        return 1;                                /* abort walk */
+    }
+    const char *rel = fpath;
+    if (g_walk_root_len > 0 &&
+        strncmp(fpath, g_walk_root, g_walk_root_len) == 0) {
+        rel = fpath + g_walk_root_len;
+        if (*rel == '/') rel++;
+    }
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddStringToObject(entry, "path", rel);
+    cJSON_AddNumberToObject(entry, "size", (double)sb->st_size);
+    cJSON_AddItemToArray(g_walk_files, entry);
+    g_walk_count++;
+    g_walk_total += (uint64_t)sb->st_size;
+    return 0;
+}
+
+static void handle_get_stat(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j;
+    j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "get_stat: path is required");
+        return;
+    }
+    const char *src_path = j->valuestring;
+
+    /* lstat first so we can refuse to traverse a symlinked root — same
+     * principle as FTW_PHYS below: never silently follow links. */
+    struct stat st;
+    if (lstat(src_path, &st) < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "get_stat: cannot stat %s: %s",
+                 src_path, strerror(errno));
+        send_error(fd, req_id, "error", msg);
+        return;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version", 1);
+    cJSON_AddStringToObject(resp, "id",      req_id);
+    cJSON_AddStringToObject(resp, "node",    g_cfg->node_name);
+    cJSON_AddStringToObject(resp, "status",  "ok");
+    cJSON_AddStringToObject(resp, "path",    src_path);
+
+    if (S_ISREG(st.st_mode)) {
+        cJSON_AddBoolToObject  (resp, "isdir", 0);
+        cJSON_AddNumberToObject(resp, "size",  (double)st.st_size);
+    } else if (S_ISDIR(st.st_mode)) {
+        cJSON *files = cJSON_CreateArray();
+        g_walk_files    = files;
+        g_walk_root     = src_path;
+        g_walk_root_len = strlen(src_path);
+        /* Strip trailing slash so the relative-path math doesn't double up. */
+        while (g_walk_root_len > 1 && src_path[g_walk_root_len - 1] == '/')
+            g_walk_root_len--;
+        g_walk_total  = 0;
+        g_walk_count  = 0;
+        g_walk_capped = 0;
+
+        /* FTW_PHYS: don't follow symlinks. 32 fds is plenty and well under
+         * the daemon's open-file limit. */
+        int rc = nftw(src_path, get_stat_walk_cb, 32, FTW_PHYS);
+        if (rc < 0 && !g_walk_capped) {
+            cJSON_Delete(files);
+            cJSON_Delete(resp);
+            char msg[300];
+            snprintf(msg, sizeof(msg), "get_stat: walk failed at %s: %s",
+                     src_path, strerror(errno));
+            send_error(fd, req_id, "error", msg);
+            return;
+        }
+
+        cJSON_AddBoolToObject  (resp, "isdir", 1);
+        cJSON_AddNumberToObject(resp, "size",  (double)g_walk_total);
+        cJSON_AddItemToObject  (resp, "files", files);
+        if (g_walk_capped) {
+            cJSON_AddBoolToObject  (resp, "truncated", 1);
+            char msg[200];
+            snprintf(msg, sizeof(msg),
+                     "directory contains more than %d files; narrow the path",
+                     HL_GET_STAT_MAX_FILES);
+            cJSON_AddStringToObject(resp, "error_msg", msg);
+            /* Status stays "ok" so the client can render the partial listing,
+             * but it must check truncated before acting on `files`. */
+        }
+    } else {
+        cJSON_Delete(resp);
+        send_error(fd, req_id, "error",
+                   "get_stat: path is neither regular file nor directory");
+        return;
+    }
+
     frame_send_json(fd, resp);
     cJSON_Delete(resp);
 }
@@ -742,7 +887,8 @@ static void dispatch_connection(int client_fd) {
      * agents calling hl-get/hl-put, that meant a single multi-MiB transfer
      * froze the whole daemon. Forking matches the exec model. */
     if (!strcmp(type, "put")        || !strcmp(type, "get") ||
-        !strcmp(type, "put_stream") || !strcmp(type, "get_stream")) {
+        !strcmp(type, "put_stream") || !strcmp(type, "get_stream") ||
+        !strcmp(type, "get_stat")) {
         cJSON *id_j = cJSON_GetObjectItem(req, "id");
         const char *req_id = cJSON_IsString(id_j) ? id_j->valuestring : "";
 
@@ -771,7 +917,8 @@ static void dispatch_connection(int client_fd) {
             if      (!strcmp(type, "put"))        handle_put       (client_fd, req);
             else if (!strcmp(type, "get"))        handle_get       (client_fd, req);
             else if (!strcmp(type, "put_stream")) handle_put_stream(client_fd, req);
-            else                                  handle_get_stream(client_fd, req);
+            else if (!strcmp(type, "get_stream")) handle_get_stream(client_fd, req);
+            else                                  handle_get_stat  (client_fd, req);
             _exit(0);
         }
 

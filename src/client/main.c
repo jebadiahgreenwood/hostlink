@@ -7,7 +7,9 @@
 #include <getopt.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include "connection.h"
 #include "../common/protocol.h"
 #include "../common/config.h"
@@ -16,7 +18,7 @@
 #include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.3.0"
+#define VERSION "1.4.0"
 
 #define EXIT_OK           0
 #define EXIT_REMOTE_ERR   1
@@ -517,6 +519,208 @@ static int cmd_get(cli_opts_t *opts, const char *remote_path, const char *local_
 #define HL_STREAM_CHUNK   (4u * 1024u * 1024u)
 #define HL_STREAM_AUTO_THRESHOLD  (90u * 1024u * 1024u)  /* legacy get/put cap */
 
+/* Headroom for the local free-space check before a get. We don't want to
+ * fill the partition to the byte; reserve a small fixed buffer so the user
+ * doesn't end up with a wedged disk on a tight squeeze. */
+#define HL_GET_FREE_SPACE_HEADROOM  (16ull * 1024 * 1024)
+
+/* Result of a get_stat probe. For directories, `files` and `count` are owned
+ * by the caller (free with get_stat_free). For files, both are NULL/0. */
+typedef struct {
+    int       isdir;
+    uint64_t  size;            /* file size, or sum of files if isdir */
+    int       truncated;       /* daemon hit HL_GET_STAT_MAX_FILES */
+    char      err[256];        /* populated on truncation, used as warning */
+    /* Directory listing: parallel arrays so we don't allocate a struct per
+     * entry. Each path is a malloc'd string relative to the requested root. */
+    char    **paths;
+    uint64_t *sizes;
+    size_t    count;
+} get_stat_t;
+
+static void get_stat_free(get_stat_t *gs) {
+    if (!gs) return;
+    if (gs->paths) {
+        for (size_t i = 0; i < gs->count; i++) free(gs->paths[i]);
+        free(gs->paths);
+    }
+    free(gs->sizes);
+    gs->paths = NULL; gs->sizes = NULL; gs->count = 0;
+}
+
+/* Probe the remote daemon for size/type information about `remote_path`.
+ * On success returns 0 and populates *out (caller must get_stat_free).
+ * On error returns one of EXIT_* and writes a human message to stderr.
+ *
+ * One round-trip; cheap on Unix sockets, ~1ms over 10GbE. */
+static int query_get_stat(cli_opts_t *opts, const char *remote_path,
+                          get_stat_t *out) {
+    memset(out, 0, sizeof(*out));
+
+    int fd = open_connection(opts);
+    if (fd < 0) return EXIT_CONN_FAILED;
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "get_stat");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+
+    if (frame_send_json(fd, req) != 0) {
+        cJSON_Delete(req); close(fd);
+        fprintf(stderr, "get: failed to send stat request\n");
+        return EXIT_CONN_FAILED;
+    }
+    cJSON_Delete(req);
+
+    char *payload = NULL;
+    ssize_t n = frame_recv(fd, &payload);
+    close(fd);
+    if (n <= 0) { free(payload); return EXIT_PROTO_ERR; }
+
+    cJSON *resp = cJSON_Parse(payload);
+    free(payload);
+    if (!resp) return EXIT_PROTO_ERR;
+
+    cJSON *j;
+    const char *status = "", *node = "", *err_msg = NULL;
+    j = cJSON_GetObjectItem(resp, "status");    if (cJSON_IsString(j)) status  = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "node");      if (cJSON_IsString(j)) node    = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "error_msg"); if (cJSON_IsString(j)) err_msg = j->valuestring;
+
+    if (!strcmp(status, "auth_failed")) {
+        if (opts->json_output) {
+            char *s = cJSON_PrintUnformatted(resp);
+            if (s) { printf("%s\n", s); free(s); }
+        }
+        fprintf(stderr, "Authentication failed\n");
+        cJSON_Delete(resp); return EXIT_AUTH_FAILED;
+    }
+    if (strcmp(status, "ok") != 0) {
+        /* Preserve the legacy `-j get` contract: the daemon's error JSON
+         * lands on stdout so callers can parse it. */
+        if (opts->json_output) {
+            char *s = cJSON_PrintUnformatted(resp);
+            if (s) { printf("%s\n", s); free(s); }
+        }
+        fprintf(stderr, "[%s] get error: %s\n",
+                node, err_msg ? err_msg : status);
+        cJSON_Delete(resp); return EXIT_REMOTE_ERR;
+    }
+
+    j = cJSON_GetObjectItem(resp, "isdir"); out->isdir = cJSON_IsTrue(j);
+    j = cJSON_GetObjectItem(resp, "size");
+    if (cJSON_IsNumber(j)) out->size = (uint64_t)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "truncated"); out->truncated = cJSON_IsTrue(j);
+    if (out->truncated && err_msg)
+        snprintf(out->err, sizeof(out->err), "%s", err_msg);
+
+    if (out->isdir) {
+        cJSON *files = cJSON_GetObjectItem(resp, "files");
+        if (cJSON_IsArray(files)) {
+            int sz = cJSON_GetArraySize(files);
+            if (sz > 0) {
+                out->paths = calloc((size_t)sz, sizeof(char *));
+                out->sizes = calloc((size_t)sz, sizeof(uint64_t));
+                if (!out->paths || !out->sizes) {
+                    get_stat_free(out);
+                    cJSON_Delete(resp);
+                    fprintf(stderr, "get: out of memory parsing stat response\n");
+                    return EXIT_CLIENT_ERR;
+                }
+            }
+            for (int i = 0; i < sz; i++) {
+                cJSON *e = cJSON_GetArrayItem(files, i);
+                cJSON *pj = cJSON_GetObjectItem(e, "path");
+                cJSON *sj = cJSON_GetObjectItem(e, "size");
+                if (!cJSON_IsString(pj) || !cJSON_IsNumber(sj)) continue;
+                out->paths[out->count] = strdup(pj->valuestring);
+                out->sizes[out->count] = (uint64_t)sj->valuedouble;
+                out->count++;
+            }
+        }
+    }
+
+    cJSON_Delete(resp);
+    return EXIT_OK;
+}
+
+/* Recursively mkdir -p `path`. Returns 0 on success.
+ * On failure, sets errno and returns -1. */
+static int mkdir_p(const char *path, mode_t mode) {
+    if (!path || !*path) { errno = EINVAL; return -1; }
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len && tmp[len - 1] == '/') tmp[len - 1] = '\0';
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) < 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Find the deepest existing directory in the path of `local_path`. We can't
+ * statvfs a path that doesn't exist, but we can statvfs its closest extant
+ * ancestor — same filesystem, same free-space answer. */
+static int find_extant_ancestor(const char *local_path, char *out, size_t out_sz) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", local_path);
+    while (1) {
+        struct stat st;
+        if (stat(buf, &st) == 0) { snprintf(out, out_sz, "%s", buf); return 0; }
+        char *slash = strrchr(buf, '/');
+        if (!slash) { snprintf(out, out_sz, "."); return 0; }
+        if (slash == buf) { snprintf(out, out_sz, "/"); return 0; }
+        *slash = '\0';
+    }
+}
+
+/* Verify the local filesystem at `local_path` has at least `need` bytes free
+ * (plus headroom). If not, print a clear message and return EXIT_CLIENT_ERR.
+ *
+ * We use f_bavail (blocks available to non-root) rather than f_bfree, which
+ * matches what users see from `df` and avoids surprises when the partition
+ * has root-reserve set (ext4 reserves 5% by default). */
+static int check_free_space(const char *local_path, uint64_t need) {
+    char ancestor[1024];
+    if (find_extant_ancestor(local_path, ancestor, sizeof(ancestor)) < 0) {
+        fprintf(stderr, "get: cannot resolve filesystem for %s: %s\n",
+                local_path, strerror(errno));
+        return EXIT_CLIENT_ERR;
+    }
+    struct statvfs vfs;
+    if (statvfs(ancestor, &vfs) < 0) {
+        fprintf(stderr, "get: statvfs(%s) failed: %s\n",
+                ancestor, strerror(errno));
+        return EXIT_CLIENT_ERR;
+    }
+    uint64_t avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+    uint64_t want  = need + HL_GET_FREE_SPACE_HEADROOM;
+    if (avail < want) {
+        fprintf(stderr,
+                "get: insufficient disk space on %s: need %llu bytes "
+                "(%.2f MiB) plus %llu MiB headroom, only %llu bytes "
+                "(%.2f MiB) available\n",
+                ancestor,
+                (unsigned long long)need,
+                (double)need / (1024.0 * 1024.0),
+                (unsigned long long)(HL_GET_FREE_SPACE_HEADROOM / (1024 * 1024)),
+                (unsigned long long)avail,
+                (double)avail / (1024.0 * 1024.0));
+        return EXIT_CLIENT_ERR;
+    }
+    return EXIT_OK;
+}
+
 static int cmd_get_stream(cli_opts_t *opts, const char *remote_path, const char *local_path) {
     int fd = open_connection(opts);
     if (fd < 0) return EXIT_CONN_FAILED;
@@ -653,6 +857,110 @@ static int cmd_get_stream(cli_opts_t *opts, const char *remote_path, const char 
                node, (unsigned long long)total, local_hex);
 
     return EXIT_OK;
+}
+
+/* cmd_get_smart: the transparent `get` entry point (v1.4+).
+ *
+ * One round-trip stat tells us:
+ *   1. Is the remote a file or a directory?
+ *   2. What's the total size? (sum of files for a directory)
+ *
+ * From there we:
+ *   - Refuse early if the local filesystem doesn't have room (statvfs).
+ *   - Pick legacy or streaming per-file based on size (90 MiB threshold).
+ *   - For directories, mkdir the destination and pull each file into its
+ *     relative slot (cp-style: `get /remote/foo /tmp/bar` puts files at
+ *     /tmp/bar/<rel>). Aborts on the first failure — partial files stay so
+ *     the user can see how far it got.
+ *
+ * Honors --stream (force streaming for the file path) for users who want
+ * the SHA-256 verification on small files too. */
+static int cmd_get_smart(cli_opts_t *opts, const char *remote_path,
+                         const char *local_path) {
+    get_stat_t gs;
+    int rc = query_get_stat(opts, remote_path, &gs);
+    if (rc != EXIT_OK) return rc;
+
+    if (gs.truncated) {
+        fprintf(stderr, "get: %s\n",
+                gs.err[0] ? gs.err : "remote listing truncated");
+        get_stat_free(&gs);
+        return EXIT_REMOTE_ERR;
+    }
+
+    /* Free-space check uses the destination's filesystem. For a dir we look
+     * at local_path itself (which we'll create); for a file we look at its
+     * parent. find_extant_ancestor walks up until it hits something that
+     * exists, so passing either is safe. */
+    rc = check_free_space(local_path, gs.size);
+    if (rc != EXIT_OK) { get_stat_free(&gs); return rc; }
+
+    if (!gs.isdir) {
+        get_stat_free(&gs);
+        int use_stream = opts->stream || gs.size > HL_STREAM_AUTO_THRESHOLD;
+        return use_stream
+             ? cmd_get_stream(opts, remote_path, local_path)
+             : cmd_get       (opts, remote_path, local_path);
+    }
+
+    /* Directory mode. Refuse to clobber an existing file at local_path. */
+    struct stat lst;
+    if (stat(local_path, &lst) == 0 && !S_ISDIR(lst.st_mode)) {
+        fprintf(stderr,
+                "get: destination %s exists and is not a directory\n",
+                local_path);
+        get_stat_free(&gs);
+        return EXIT_CLIENT_ERR;
+    }
+    if (mkdir_p(local_path, 0755) < 0) {
+        fprintf(stderr, "get: cannot create %s: %s\n",
+                local_path, strerror(errno));
+        get_stat_free(&gs);
+        return EXIT_CLIENT_ERR;
+    }
+
+    if (!opts->json_output)
+        fprintf(stderr, "get: %zu files, %llu bytes total, dest=%s\n",
+                gs.count, (unsigned long long)gs.size, local_path);
+
+    int dir_rc = EXIT_OK;
+    for (size_t i = 0; i < gs.count; i++) {
+        char remote_full[1024];
+        char local_full[1024];
+        snprintf(remote_full, sizeof(remote_full), "%s/%s",
+                 remote_path, gs.paths[i]);
+        snprintf(local_full,  sizeof(local_full),  "%s/%s",
+                 local_path, gs.paths[i]);
+
+        /* mkdir for the file's parent. dirname() may modify its arg, so
+         * work on a copy. */
+        char parent_buf[1024];
+        snprintf(parent_buf, sizeof(parent_buf), "%s", local_full);
+        char *parent = dirname(parent_buf);
+        if (parent && strcmp(parent, ".") != 0 && strcmp(parent, "/") != 0) {
+            if (mkdir_p(parent, 0755) < 0) {
+                fprintf(stderr, "get: cannot create %s: %s\n",
+                        parent, strerror(errno));
+                dir_rc = EXIT_CLIENT_ERR;
+                break;
+            }
+        }
+
+        int use_stream = opts->stream || gs.sizes[i] > HL_STREAM_AUTO_THRESHOLD;
+        int file_rc = use_stream
+                    ? cmd_get_stream(opts, remote_full, local_full)
+                    : cmd_get       (opts, remote_full, local_full);
+        if (file_rc != EXIT_OK) {
+            fprintf(stderr,
+                    "get: aborting after failure on %s (%zu of %zu done)\n",
+                    gs.paths[i], i, gs.count);
+            dir_rc = file_rc;
+            break;
+        }
+    }
+
+    get_stat_free(&gs);
+    return dir_rc;
 }
 
 static int cmd_put_stream(cli_opts_t *opts, const char *local_path, const char *remote_path) {
@@ -956,7 +1264,8 @@ int main(int argc, char *argv[]) {
                        "Subcommands:\n"
                        "  exec <cmd>                  Run a command on the remote host\n"
                        "  put  <local> <remote>       Transfer a file (auto-streams if > 90 MiB)\n"
-                       "  get  <remote> <local>       Retrieve a file (use --stream for > 90 MiB)\n"
+                       "  get  <remote> <local>       Retrieve a file or directory (auto-streams\n"
+                       "                              large files; checks local free space first)\n"
                        "  put-stream <local> <remote> Force-stream a put (sha256-verified)\n"
                        "  get-stream <remote> <local> Force-stream a get (sha256-verified)\n"
                        "  ping                        Check if the daemon is alive\n"
@@ -976,8 +1285,9 @@ int main(int argc, char *argv[]) {
                        "  -D, --detach   Fire-and-forget: return immediately, no output\n"
                        "  --mkdir        Create parent directories on put\n"
                        "  --mode <oct>   File permissions on put (default 644)\n"
-                       "  --stream       Use streaming protocol (no 90 MiB cap, sha256 verified)\n"
-                       "                 Required for files > ~95 MiB; auto-applied to large puts.\n"
+                       "  --stream       Force streaming protocol (sha256 verified) even for\n"
+                       "                 small files. `get` and `put` already auto-stream when\n"
+                       "                 the file is large; this flag is for verification.\n"
                        "  --targets-file <path>  Override targets config path\n");
                 return EXIT_OK;
             case 'V': printf("hostlink-cli %s\n", VERSION); return EXIT_OK;
@@ -1034,12 +1344,11 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "get requires: <remote_path> <local_path>\n");
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        /* For get we don't know the remote size up-front, so streaming is
-         * opt-in via --stream. The legacy get error message tells the user
-         * to retry with --stream if they hit the 90 MiB cap. */
-        rc = opts.stream
-             ? cmd_get_stream(&opts, argv[optind], argv[optind + 1])
-             : cmd_get       (&opts, argv[optind], argv[optind + 1]);
+        /* Smart dispatcher: probes remote size with get_stat, checks local
+         * free space, then routes to legacy or streaming per-file. Handles
+         * directories transparently (cp-style: local path becomes the new
+         * directory). --stream still works as an explicit override. */
+        rc = cmd_get_smart(&opts, argv[optind], argv[optind + 1]);
     } else if (!strcmp(subcmd, "get-stream") || !strcmp(subcmd, "get_stream")) {
         if (optind + 1 >= argc) {
             fprintf(stderr, "get-stream requires: <remote_path> <local_path>\n");

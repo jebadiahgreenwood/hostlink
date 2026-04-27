@@ -698,19 +698,19 @@ round_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_smal
 assert    "test_stream_put_small_rc"     "$([ "$put_rc" -eq 0 ] && echo 0 || echo 1)"
 assert_eq "test_stream_put_small_sha256" "$round_sha" "$src_sha"
 
-# ---- test_stream_large_get_above_legacy_cap ----
-# 100 MiB file — legacy `get` would reject this (>90 MiB), `get-stream` succeeds.
+# ---- test_get_auto_streams_above_90mib (v1.4) ----
+# 100 MiB file — `get` (no flag) must auto-promote to streaming and succeed,
+# matching the source sha256. Pre-v1.4 this was rejected with the 90 MiB cap.
 "$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=/tmp/hl_stream_big_src_$$.bin bs=1M count=100 status=none" >/dev/null 2>&1
 big_src_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum /tmp/hl_stream_big_src_$$.bin | awk '{print \$1}'" 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stdout','').strip())" 2>/dev/null || echo "")
-# Legacy get must be rejected. Don't fall back to "{}" on nonzero exit — the
-# CLI prints valid JSON to stdout AND exits nonzero on remote errors, and
-# appending "{}" pollutes the output and breaks json.load.
-out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j -T 10000 get \
-    /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_dst_legacy_$$.bin 2>/dev/null) || true
-legacy_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
-assert_eq "test_stream_legacy_get_rejected_at_90mib" "$legacy_status" "error"
-# Stream must succeed
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 get \
+    /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_dst_legacy_$$.bin >/dev/null 2>&1
+auto_rc=$?
+auto_sha=$(sha256sum /tmp/hl_stream_big_dst_legacy_$$.bin 2>/dev/null | awk '{print $1}')
+assert    "test_get_auto_streams_above_90mib_rc"     "$([ "$auto_rc" -eq 0 ] && echo 0 || echo 1)"
+assert_eq "test_get_auto_streams_above_90mib_sha256" "$auto_sha" "$big_src_sha"
+# get-stream still works as the explicit form
 "$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 get-stream \
     /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_dst_$$.bin >/dev/null 2>&1
 big_dst_sha=$(sha256sum /tmp/hl_stream_big_dst_$$.bin 2>/dev/null | awk '{print $1}')
@@ -740,6 +740,124 @@ assert "test_stream_get_nonexistent_no_local" \
 # Cleanup
 "$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f /tmp/hl_stream_small_src_$$.bin /tmp/hl_stream_small_round_$$.bin /tmp/hl_stream_big_src_$$.bin /tmp/hl_stream_big_auto_$$.bin /tmp/hl_stream_nope_$$.bin" >/dev/null 2>&1 || true
 rm -f /tmp/hl_stream_tiny_$$.txt /tmp/hl_stream_small_dst_$$.bin /tmp/hl_stream_big_dst_$$.bin /tmp/hl_stream_big_dst_legacy_$$.bin /tmp/hl_stream_nope_dst_$$.bin
+
+# ============================================================================
+# v1.4: transparent get — auto-stream, directory mode, free-space check
+# ============================================================================
+
+# ---- test_get_stat_file ----
+# get_stat returns isdir=false and the right size for a regular file.
+GET_STAT_SRC="/tmp/hl_get_stat_src_$$.bin"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=$GET_STAT_SRC bs=1024 count=10 status=none" >/dev/null 2>&1
+out=$(python3 - "$SOCK" "$TOKEN" "$GET_STAT_SRC" <<'PY' 2>/dev/null
+import socket, struct, json, sys
+sock_path, token, path = sys.argv[1], sys.argv[2], sys.argv[3]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sock_path)
+req = json.dumps({"version":1,"type":"get_stat","id":"t1","token":token,"path":path}).encode()
+s.sendall(struct.pack(">II", 0x484C4E4B, len(req)) + req)
+hdr = s.recv(8); _, plen = struct.unpack(">II", hdr)
+buf = b""
+while len(buf) < plen: buf += s.recv(plen - len(buf))
+print(buf.decode())
+PY
+)
+isdir=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('isdir'))" 2>/dev/null || echo ERR)
+size=$(echo "$out"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('size'))"  2>/dev/null || echo ERR)
+assert_eq "test_get_stat_file_isdir" "$isdir" "False"
+assert_eq "test_get_stat_file_size"  "$size"  "10240"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f $GET_STAT_SRC" >/dev/null 2>&1
+
+# ---- test_get_directory_simple ----
+# `get` on a directory pulls every regular file, mirroring tree under the
+# local destination (cp-style: local arg becomes the new dir).
+SRC_DIR="/tmp/hl_getdir_src_$$"
+DST_DIR="/tmp/hl_getdir_dst_$$"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "
+    mkdir -p $SRC_DIR/sub/nested && \
+    echo a > $SRC_DIR/a.txt && \
+    echo b > $SRC_DIR/sub/b.txt && \
+    dd if=/dev/urandom of=$SRC_DIR/sub/nested/big.bin bs=1024 count=8 status=none" >/dev/null 2>&1
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 30000 get "$SRC_DIR" "$DST_DIR" >/dev/null 2>&1
+dir_rc=$?
+assert "test_get_directory_rc" "$([ "$dir_rc" -eq 0 ] && echo 0 || echo 1)"
+assert "test_get_directory_top_file"    "$([ -f $DST_DIR/a.txt ] && echo 0 || echo 1)"
+assert "test_get_directory_nested_text" "$([ -f $DST_DIR/sub/b.txt ] && echo 0 || echo 1)"
+assert "test_get_directory_nested_bin"  "$([ -f $DST_DIR/sub/nested/big.bin ] && echo 0 || echo 1)"
+# Sha sanity check on the binary
+src_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum $SRC_DIR/sub/nested/big.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['stdout'].strip())" 2>/dev/null || echo "")
+dst_sha=$(sha256sum "$DST_DIR/sub/nested/big.bin" 2>/dev/null | awk '{print $1}')
+assert_eq "test_get_directory_nested_sha256" "$dst_sha" "$src_sha"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -rf $SRC_DIR" >/dev/null 2>&1
+rm -rf "$DST_DIR"
+
+# ---- test_get_directory_with_large_file ----
+# Mixed dir: one tiny file + one >90 MiB file. The big one must auto-stream
+# and the small one must take the legacy path (both succeed).
+SRC_DIR2="/tmp/hl_getdir2_src_$$"
+DST_DIR2="/tmp/hl_getdir2_dst_$$"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "
+    mkdir -p $SRC_DIR2 && \
+    echo small > $SRC_DIR2/small.txt && \
+    dd if=/dev/urandom of=$SRC_DIR2/big.bin bs=1M count=95 status=none" >/dev/null 2>&1
+src_big_sha=$("$CLI" -s "$SOCK" -k "$TOKEN" -j exec "sha256sum $SRC_DIR2/big.bin | awk '{print \$1}'" 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['stdout'].strip())" 2>/dev/null || echo "")
+"$CLI" -s "$SOCK" -k "$TOKEN" -T 60000 get "$SRC_DIR2" "$DST_DIR2" >/dev/null 2>&1
+mix_rc=$?
+dst_big_sha=$(sha256sum "$DST_DIR2/big.bin" 2>/dev/null | awk '{print $1}')
+assert    "test_get_dir_mixed_rc"        "$([ "$mix_rc" -eq 0 ] && echo 0 || echo 1)"
+assert_eq "test_get_dir_mixed_big_sha"   "$dst_big_sha" "$src_big_sha"
+assert    "test_get_dir_mixed_small"     "$([ -f $DST_DIR2/small.txt ] && echo 0 || echo 1)"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -rf $SRC_DIR2" >/dev/null 2>&1
+rm -rf "$DST_DIR2"
+
+# ---- test_get_dest_is_file_error ----
+# Refuse to overwrite a file with a directory pull.
+SRC_DIR3="/tmp/hl_getdir3_src_$$"
+DST_FILE3="/tmp/hl_getdir3_dst_$$.txt"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "mkdir -p $SRC_DIR3 && echo x > $SRC_DIR3/a.txt" >/dev/null 2>&1
+echo "do not overwrite" > "$DST_FILE3"
+"$CLI" -s "$SOCK" -k "$TOKEN" get "$SRC_DIR3" "$DST_FILE3" >/dev/null 2>&1
+err_rc=$?
+content=$(cat "$DST_FILE3")
+assert    "test_get_dest_is_file_fails" "$([ "$err_rc" -ne 0 ] && echo 0 || echo 1)"
+assert_eq "test_get_dest_is_file_kept"  "$content" "do not overwrite"
+"$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -rf $SRC_DIR3" >/dev/null 2>&1
+rm -f "$DST_FILE3"
+
+# ---- test_get_remote_missing_json ----
+# `-j get` on a missing remote path must still emit JSON with status:"error"
+# (regression check: the v1.4 stat probe must not eat the JSON contract).
+out=$("$CLI" -s "$SOCK" -k "$TOKEN" -j get \
+      "/tmp/hl_get_v14_missing_$$.dat" "/tmp/hl_get_v14_dst_$$.dat" 2>/dev/null) || true
+v14_status=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "ERR")
+assert_eq "test_get_v14_missing_json_status" "$v14_status" "error"
+assert "test_get_v14_missing_no_local" \
+    "$([ ! -f /tmp/hl_get_v14_dst_$$.dat ] && echo 0 || echo 1)"
+
+# ---- test_get_insufficient_space ----
+# Force the free-space check to trip by pulling onto a tiny tmpfs.
+TMPFS_DIR="/tmp/hl_getfs_$$"
+mkdir -p "$TMPFS_DIR"
+TMPFS_MOUNTED=0
+if mount -t tmpfs -o size=1M tmpfs "$TMPFS_DIR" 2>/dev/null; then
+    TMPFS_MOUNTED=1
+    "$CLI" -s "$SOCK" -k "$TOKEN" exec "dd if=/dev/urandom of=/tmp/hl_getfs_src_$$.bin bs=1M count=10 status=none" >/dev/null 2>&1
+    err_out=$("$CLI" -s "$SOCK" -k "$TOKEN" get \
+              "/tmp/hl_getfs_src_$$.bin" "$TMPFS_DIR/dest.bin" 2>&1) || true
+    case "$err_out" in
+        *"insufficient disk space"*) PASS=$((PASS+1)); echo "PASS: test_get_insufficient_space" ;;
+        *) FAIL=$((FAIL+1)); echo "FAIL: test_get_insufficient_space (got: $err_out)" ;;
+    esac
+    assert "test_get_insufficient_space_no_local" \
+        "$([ ! -f $TMPFS_DIR/dest.bin ] && echo 0 || echo 1)"
+    "$CLI" -s "$SOCK" -k "$TOKEN" exec "rm -f /tmp/hl_getfs_src_$$.bin" >/dev/null 2>&1
+    umount "$TMPFS_DIR" 2>/dev/null || true
+else
+    # Skip if we can't mount tmpfs (no privilege in some sandboxes)
+    echo "SKIP: test_get_insufficient_space (mount tmpfs unavailable)"
+fi
+rm -rf "$TMPFS_DIR"
 
 # ---- Summary ----
 echo ""
