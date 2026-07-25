@@ -49,8 +49,17 @@ EOF
 "$DAEMON" -c "$T/hostlink.conf" -p "$T/hl.pid" -f > "$T/daemon.stderr" 2>&1 &
 DPID=$!
 trap 'kill $DPID 2>/dev/null' EXIT
-for _ in $(seq 1 50); do [ -S "$T/hl.sock" ] && break; sleep 0.1; done
-[ -S "$T/hl.sock" ] || { echo "FATAL: daemon did not start"; cat "$T/daemon.stderr"; exit 1; }
+# Wait for the daemon to actually ANSWER, not merely for the socket file to
+# exist: bind() creates the path well before the accept loop is running, and on
+# a slower box that window is wide enough to fail the first assertion.
+ready=0
+for _ in $(seq 1 100); do
+  if [ -S "$T/hl.sock" ] && "$CLI" -s "$T/hl.sock" -k "$TOKEN" ping >/dev/null 2>&1; then
+    ready=1; break
+  fi
+  sleep 0.1
+done
+[ "$ready" = "1" ] || { echo "FATAL: daemon did not become ready"; cat "$T/daemon.stderr"; exit 1; }
 
 hl() { "$CLI" -s "$T/hl.sock" -k "$TOKEN" "$@"; }
 
@@ -205,6 +214,125 @@ check_eq "pipeline exit status" "$(hl exec 'echo x | grep -q y'; echo $?)" "1"
 check_eq "large output not truncated" "$(hl exec 'seq 1 20000 | tail -1' 2>/dev/null)" "20000"
 hl ping >/dev/null 2>&1; check_eq "ping ok" "$?" "0"
 hl exec 'echo detach-target' -D >/dev/null 2>&1; check_eq "detach flag before subcmd" "$(hl -D exec 'true' >/dev/null 2>&1; echo $?)" "0"
+
+# ---- build a source tree with nesting, an empty dir, a symlink, odd names ----
+SRC="$T/src"
+mkdir -p "$SRC/a/b/c" "$SRC/assets/img" "$SRC/empty" "$SRC/.cache/blobs"
+echo top            > "$SRC/top.txt"
+echo deep           > "$SRC/a/b/c/deep.txt"
+echo img            > "$SRC/assets/img/logo.bin"
+echo asset          > "$SRC/assets/style.css"
+echo cached         > "$SRC/.cache/blobs/junk.bin"
+echo cachedtop      > "$SRC/.cache/meta.json"
+echo 'spaces here'  > "$SRC/a/name with spaces.txt"
+echo obj            > "$SRC/a/b/thing.o"
+head -c 300000 /dev/urandom > "$SRC/assets/big.bin"
+ln -s top.txt        "$SRC/link-to-top"
+ln -s /etc           "$SRC/link-to-etc"
+NREG=$(find "$SRC" -type f | wc -l)
+
+echo "=== F3: directory put ==="
+echo "--- basic recursive put ---"
+rm -rf "$T/dst"
+out=$(hl put "$SRC" "$T/dst" 2>&1); rc=$?
+check_eq "put of a directory succeeds" "$rc" "0"
+check_eq "all regular files landed" "$(find "$T/dst" -type f | wc -l)" "$NREG"
+check_eq "nested structure mirrored" "$(cat "$T/dst/a/b/c/deep.txt" 2>/dev/null)" "deep"
+check_eq "file with spaces in the name" "$(cat "$T/dst/a/name with spaces.txt" 2>/dev/null)" "spaces here"
+cmp -s "$SRC/assets/big.bin" "$T/dst/assets/big.bin" && ok "300KB binary byte-identical" || bad "big.bin" "differs"
+echo "$out" | grep -q "$NREG files" && ok "summary reports the file count" || bad "summary" "got [$(echo "$out"|head -1)]"
+
+echo "--- symlinks are not followed (parity with get's FTW_PHYS walk) ---"
+[ ! -e "$T/dst/link-to-top" ] && ok "symlink not transferred" || bad "symlink" "it was transferred"
+[ ! -d "$T/dst/link-to-etc" ] && ok "symlinked dir not descended into" || bad "symlink dir" "descended"
+echo "$out" | grep -q 'skipped 2 symlink' && ok "skipped symlinks are reported, not silent" || bad "skip report" "not mentioned"
+
+echo "--- empty directories (documented shared limitation with get) ---"
+[ ! -d "$T/dst/empty" ] && ok "empty dir absent, as with get (files-only transfer)" \
+                        || bad "empty dir" "unexpectedly present"
+
+echo "--- --exclude ---"
+rm -rf "$T/dst2"
+hl put "$SRC" "$T/dst2" --exclude .cache >/dev/null 2>&1
+[ ! -e "$T/dst2/.cache" ] && ok "--exclude .cache prunes the whole subtree" || bad "exclude dir" "still there"
+check_eq "non-excluded files still all present" "$(find "$T/dst2" -type f | wc -l)" "$((NREG-2))"
+rm -rf "$T/dst3"
+hl put "$SRC" "$T/dst3" --exclude '*.o' --exclude '.cache' >/dev/null 2>&1
+[ ! -e "$T/dst3/a/b/thing.o" ] && ok "--exclude '*.o' matches basenames" || bad "exclude glob" "still there"
+check_eq "two excludes compose" "$(find "$T/dst3" -type f | wc -l)" "$((NREG-3))"
+rm -rf "$T/dst4"
+hl put "$SRC" "$T/dst4" --exclude 'assets/style.css' >/dev/null 2>&1
+[ ! -e "$T/dst4/assets/style.css" ] && ok "--exclude matches a full relative path" || bad "exclude relpath" "still there"
+[ -e "$T/dst4/assets/img/logo.bin" ] && ok "sibling under same dir untouched" || bad "exclude overreach" "removed too much"
+rm -rf "$T/dst5"; hl put --exclude .cache "$SRC" "$T/dst5" >/dev/null 2>&1
+[ ! -e "$T/dst5/.cache" ] && ok "--exclude works before the paths too" || bad "exclude position" "ignored"
+
+echo "--- round trip: put a tree, get it back, compare ---"
+rm -rf "$T/back"
+hl get "$T/dst" "$T/back" >/dev/null 2>&1
+if diff -r "$T/dst" "$T/back" >/dev/null 2>&1; then ok "put -> get round-trips identically"
+else bad "round trip" "$(diff -r "$T/dst" "$T/back" 2>&1 | head -3)"; fi
+check_eq "put and get agree on the file set" \
+  "$(cd "$T/dst" && find . -type f | sort | md5sum)" \
+  "$(cd "$T/back" && find . -type f | sort | md5sum)"
+
+echo "--- error handling ---"
+echo blocker > "$T/blocker"
+hl put "$SRC" "$T/blocker" >/dev/null 2>&1
+check_eq "remote destination is an existing file -> 125" "$?" "125"
+hl put "$SRC" "$T/dstX" -r >/dev/null 2>&1
+check_eq "-r rejected with guidance (dirs are automatic)" "$?" "125"
+msg=$(hl put "$SRC" "$T/dstX" -r 2>&1)
+case "$msg" in *"not needed"*) ok "-r message explains why";; *) bad "-r msg" "got [$msg]";; esac
+hl put "$SRC" "$T/dstY" --exclude >/dev/null 2>&1
+check_eq "--exclude with no pattern -> 125" "$?" "125"
+mkdir -p "$T/allexcluded/sub"; echo x > "$T/allexcluded/sub/only.o"
+hl put "$T/allexcluded" "$T/dstZ" --exclude '*.o' >/dev/null 2>&1
+check_eq "everything excluded -> 0, not a spurious failure" "$?" "0"
+hl put "$T/no-such-dir" "$T/dstW" >/dev/null 2>&1
+check_eq "missing local dir -> 125" "$?" "125"
+
+echo "--- single-file put unchanged ---"
+rm -f "$T/one.txt"; hl put "$SRC/top.txt" "$T/one.txt" >/dev/null 2>&1
+check_eq "file put still works" "$(cat "$T/one.txt" 2>/dev/null)" "top"
+rm -rf "$T/mk"; hl put "$SRC/top.txt" "$T/mk/deep/one.txt" --mkdir >/dev/null 2>&1
+[ -f "$T/mk/deep/one.txt" ] && ok "file put --mkdir still works" || bad "file mkdir" "missing"
+
+echo "--- deep trees: correct or refused, never a truncated (wrong) path ---"
+DEEP="$T/deep"; P="$DEEP"
+for i in $(seq 1 25); do P="$P/component_$i"; done
+mkdir -p "$P"; echo deeppayload > "$P/leaf.txt"
+rm -rf "$T/deepdst"; hl put "$DEEP" "$T/deepdst" >/dev/null 2>&1; rc=$?
+land=$(find "$T/deepdst" -name leaf.txt 2>/dev/null | head -1)
+want="$T/deepdst${P#$DEEP}/leaf.txt"
+if [ "$rc" = "0" ] && [ "$land" = "$want" ]; then ok "deep tree lands at the exact right path"
+elif [ "$rc" != "0" ] && [ -z "$land" ]; then ok "over-long path refused outright (no wrong-path write)"
+else bad "deep path" "rc=$rc landed=[$land] wanted=[$want]"; fi
+# and a path that definitely exceeds the composed limit must fail loudly, not truncate
+VERY="$T/very"; Q="$VERY"
+for i in $(seq 1 70); do Q="$Q/padding_component_number_$i"; done
+mkdir -p "$Q" 2>/dev/null && echo x > "$Q/leaf.txt" 2>/dev/null
+if [ -f "$Q/leaf.txt" ]; then
+  msg=$(hl put "$VERY" "$T/verydst" 2>&1); rc=$?
+  case "$msg" in
+    *"path too long"*) ok "over-limit path reports 'path too long'";;
+    *) [ "$rc" != "0" ] && ok "over-limit path fails (message: $(echo "$msg"|tail -1|cut -c1-50))" \
+                        || bad "path limit" "silently succeeded";;
+  esac
+  [ -z "$(find "$T/verydst" -name leaf.txt 2>/dev/null)" ] && ok "nothing written at a truncated path" \
+    || bad "truncated write" "a file landed somewhere wrong"
+fi
+
+echo "--- streaming path inside a directory put ---"
+rm -rf "$T/strm"; hl put "$SRC" "$T/strm" --stream >/dev/null 2>&1
+check_eq "--stream forces sha256-verified streaming for every file" "$(find "$T/strm" -type f | wc -l)" "$NREG"
+cmp -s "$SRC/assets/big.bin" "$T/strm/assets/big.bin" && ok "streamed binary byte-identical" || bad "stream big" "differs"
+n=$(hl put "$SRC" "$T/strm2" --stream 2>&1 | grep -c 'put_stream ok')
+check_eq "each file reports its own sha256 (an implicit manifest)" "$n" "$NREG"
+
+echo "--- trailing slash on the source is harmless ---"
+rm -rf "$T/dstS"; hl put "$SRC/" "$T/dstS" >/dev/null 2>&1
+check_eq "put dir/ (trailing slash) same file count" "$(find "$T/dstS" -type f | wc -l)" "$NREG"
 
 echo
 echo "=== $PASS passed, $FAIL failed ==="

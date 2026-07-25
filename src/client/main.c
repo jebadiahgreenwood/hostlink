@@ -8,6 +8,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <fnmatch.h>
+#include <ftw.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include "connection.h"
@@ -18,7 +20,7 @@
 #include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.5.0"
+#define VERSION "1.5.1"
 
 /*
  * Exit codes — ssh's model, for the same reason ssh uses it.
@@ -52,6 +54,8 @@
 #define EXIT_PROTO_ERR    EXIT_HOSTLINK_ERR
 #define EXIT_CLIENT_ERR   EXIT_HOSTLINK_ERR
 
+#define HL_MAX_EXCLUDES 32
+
 typedef struct {
     char  target[64];
     char  socket_path[256];
@@ -73,6 +77,8 @@ typedef struct {
     int   put_mkdir;        /* --mkdir: create parent dirs on put */
     int   put_mode_val;     /* octal file mode for put */
     int   stream;           /* --stream: force streaming mode for get/put */
+    char  excludes[HL_MAX_EXCLUDES][256];  /* --exclude globs, directory put */
+    int   exclude_count;
 } cli_opts_t;
 
 static const char *find_targets_file(const char *override) {
@@ -573,6 +579,7 @@ static int cmd_get(cli_opts_t *opts, const char *remote_path, const char *local_
  */
 #define HL_STREAM_CHUNK   (4u * 1024u * 1024u)
 #define HL_STREAM_AUTO_THRESHOLD  (90u * 1024u * 1024u)  /* legacy get/put cap */
+#define HL_PATH_MAX               4096  /* composed root + relative path, both directions */
 
 /* Headroom for the local free-space check before a get. We don't want to
  * fill the partition to the byte; reserve a small fixed buffer so the user
@@ -980,16 +987,25 @@ static int cmd_get_smart(cli_opts_t *opts, const char *remote_path,
 
     int dir_rc = EXIT_OK;
     for (size_t i = 0; i < gs.count; i++) {
-        char remote_full[1024];
-        char local_full[1024];
-        snprintf(remote_full, sizeof(remote_full), "%s/%s",
-                 remote_path, gs.paths[i]);
-        snprintf(local_full,  sizeof(local_full),  "%s/%s",
-                 local_path, gs.paths[i]);
+        char remote_full[HL_PATH_MAX];
+        char local_full[HL_PATH_MAX];
+        /* A silently truncated path is a path to the wrong file — check. */
+        int rn = snprintf(remote_full, sizeof(remote_full), "%s/%s",
+                          remote_path, gs.paths[i]);
+        int ln = snprintf(local_full,  sizeof(local_full),  "%s/%s",
+                          local_path, gs.paths[i]);
+        if (rn < 0 || (size_t)rn >= sizeof(remote_full) ||
+            ln < 0 || (size_t)ln >= sizeof(local_full)) {
+            fprintf(stderr,
+                    "get: path too long (limit %d bytes), stopping at: %s/%s\n",
+                    HL_PATH_MAX - 1, local_path, gs.paths[i]);
+            dir_rc = EXIT_CLIENT_ERR;
+            break;
+        }
 
         /* mkdir for the file's parent. dirname() may modify its arg, so
          * work on a copy. */
-        char parent_buf[1024];
+        char parent_buf[HL_PATH_MAX];
         snprintf(parent_buf, sizeof(parent_buf), "%s", local_full);
         char *parent = dirname(parent_buf);
         if (parent && strcmp(parent, ".") != 0 && strcmp(parent, "/") != 0) {
@@ -1184,6 +1200,238 @@ static int cmd_put_stream(cli_opts_t *opts, const char *local_path, const char *
     return ret;
 }
 
+/* ── Directory put (v1.5.1) ───────────────────────────────────────────────
+ *
+ * `get` has handled directories transparently since 1.4.0; `put` was strictly
+ * one file, so shipping a tree meant a hand-written `find | while read` loop
+ * plus pre-creating every nested subdirectory by hand. (Syncing this very
+ * repo's 22 source files to Spark for the 1.5.0 build was exactly that loop.)
+ *
+ * The walk mirrors the daemon's `get_stat` walk deliberately, so that a put
+ * and a get of the same tree agree on what "the tree" is:
+ *   - nftw with FTW_PHYS: symlinks are NOT followed (no loops, no surprise
+ *     copies of whatever they point at) and are not themselves transferred.
+ *   - regular files only; directories, symlinks, sockets, devices are skipped.
+ *   - the same HL_*_MAX_FILES ceiling, so neither side can be walked forever.
+ *   - relative paths computed by stripping the root prefix.
+ *
+ * Consequence worth knowing (shared with `get`): a tree's *empty* directories
+ * are not recreated, because only files are transferred.
+ */
+#define HL_PUT_MAX_FILES  100000   /* mirrors HL_GET_STAT_MAX_FILES */
+
+typedef struct {
+    char     *rel;
+    uint64_t  size;
+} put_entry_t;
+
+/* nftw takes no user-data pointer, so the callback works through these. The
+ * client is one process per invocation, so this is contained. */
+static put_entry_t  *g_put_files;
+static size_t        g_put_count, g_put_cap;
+static uint64_t      g_put_total;
+static size_t        g_put_root_len;
+static const char   *g_put_root;
+static int           g_put_capped, g_put_oom, g_put_skipped_nonreg;
+static char * const *g_put_excludes;
+static int           g_put_nexcludes;
+
+/* True if `rel` should be excluded. A pattern matches when it matches the
+ * basename, the whole relative path, or any leading directory component —
+ * so `--exclude .cache` prunes the whole `.cache` subtree, which is the case
+ * that motivated
+ * the flag (HuggingFace's --local-dir leaves a .cache/ nobody wants shipped). */
+static int put_excluded(const char *rel) {
+    if (g_put_nexcludes == 0) return 0;
+
+    const char *base = strrchr(rel, '/');
+    base = base ? base + 1 : rel;
+
+    for (int i = 0; i < g_put_nexcludes; i++) {
+        const char *pat = g_put_excludes[i];
+        if (fnmatch(pat, base, 0) == 0) return 1;
+        if (fnmatch(pat, rel,  0) == 0) return 1;
+
+        /* leading directory components */
+        const char *slash = rel;
+        while ((slash = strchr(slash, '/')) != NULL) {
+            size_t complen = (size_t)(slash - rel);
+            char comp[HL_PATH_MAX];
+            if (complen < sizeof(comp)) {
+                memcpy(comp, rel, complen);
+                comp[complen] = '\0';
+                if (fnmatch(pat, comp, 0) == 0) return 1;
+                const char *cbase = strrchr(comp, '/');
+                if (cbase && fnmatch(pat, cbase + 1, 0) == 0) return 1;
+            }
+            slash++;
+        }
+    }
+    return 0;
+}
+
+static int put_walk_cb(const char *fpath, const struct stat *sb,
+                       int typeflag, struct FTW *ftwbuf) {
+    (void)ftwbuf;
+    if (typeflag != FTW_F || !S_ISREG(sb->st_mode)) {
+        /* FTW_SL (symlink) and specials land here; count them so we can say
+         * so afterwards rather than silently shipping a partial tree. */
+        if (typeflag == FTW_SL || (typeflag == FTW_F && !S_ISREG(sb->st_mode)))
+            g_put_skipped_nonreg++;
+        return 0;
+    }
+    if (g_put_count >= HL_PUT_MAX_FILES) { g_put_capped = 1; return 1; }
+
+    const char *rel = fpath;
+    if (g_put_root_len > 0 && strncmp(fpath, g_put_root, g_put_root_len) == 0) {
+        rel = fpath + g_put_root_len;
+        if (*rel == '/') rel++;
+    }
+    if (!*rel) return 0;
+    if (put_excluded(rel)) return 0;
+
+    if (g_put_count == g_put_cap) {
+        size_t newcap = g_put_cap ? g_put_cap * 2 : 64;
+        put_entry_t *nf = realloc(g_put_files, newcap * sizeof(*nf));
+        if (!nf) { g_put_oom = 1; return 1; }
+        g_put_files = nf;
+        g_put_cap   = newcap;
+    }
+    char *dup = strdup(rel);
+    if (!dup) { g_put_oom = 1; return 1; }
+    g_put_files[g_put_count].rel  = dup;
+    g_put_files[g_put_count].size = (uint64_t)sb->st_size;
+    g_put_count++;
+    g_put_total += (uint64_t)sb->st_size;
+    return 0;
+}
+
+static void put_list_free(void) {
+    for (size_t i = 0; i < g_put_count; i++) free(g_put_files[i].rel);
+    free(g_put_files);
+    g_put_files = NULL;
+    g_put_count = g_put_cap = 0;
+}
+
+/* cmd_put_dir: transfer a local directory, cp-style — `put /l/foo /r/bar`
+ * places files at /r/bar/<rel>, matching `get`'s directory semantics.
+ * Aborts on the first failure, leaving what already transferred in place so
+ * the caller can see how far it got (again, as `get` does). */
+static int cmd_put_dir(cli_opts_t *opts, const char *local_path,
+                       const char *remote_path) {
+    /* Refuse to scatter a tree underneath an existing remote *file*. A stat
+     * that fails most likely means "not there yet", which is fine — we let the
+     * per-file put report it. Only a successful stat saying "regular file" is
+     * unambiguously wrong. */
+    get_stat_t rs;
+    if (query_get_stat(opts, remote_path, &rs) == EXIT_OK) {
+        int remote_is_file = !rs.isdir;
+        get_stat_free(&rs);
+        if (remote_is_file) {
+            fprintf(stderr,
+                    "put: remote %s exists and is not a directory\n",
+                    remote_path);
+            return EXIT_CLIENT_ERR;
+        }
+    }
+
+    char root[HL_PATH_MAX];
+    snprintf(root, sizeof(root), "%s", local_path);
+    size_t rlen = strlen(root);
+    while (rlen > 1 && root[rlen - 1] == '/') root[--rlen] = '\0';
+
+    const char *exc[HL_MAX_EXCLUDES];
+    for (int i = 0; i < opts->exclude_count; i++) exc[i] = opts->excludes[i];
+    g_put_excludes  = (char * const *)exc;
+    g_put_nexcludes = opts->exclude_count;
+
+    g_put_files = NULL;
+    g_put_count = g_put_cap = 0;
+    g_put_total = 0;
+    g_put_root  = root;
+    g_put_root_len = rlen;
+    g_put_capped = g_put_oom = g_put_skipped_nonreg = 0;
+
+    if (nftw(root, put_walk_cb, 32, FTW_PHYS) < 0 && !g_put_capped && !g_put_oom) {
+        fprintf(stderr, "put: cannot walk %s: %s\n", root, strerror(errno));
+        put_list_free();
+        return EXIT_CLIENT_ERR;
+    }
+    if (g_put_oom) {
+        fprintf(stderr, "put: out of memory listing %s\n", root);
+        put_list_free();
+        return EXIT_CLIENT_ERR;
+    }
+    if (g_put_capped) {
+        fprintf(stderr, "put: %s holds more than %d files; refusing to walk further\n",
+                root, HL_PUT_MAX_FILES);
+        put_list_free();
+        return EXIT_CLIENT_ERR;
+    }
+    if (g_put_count == 0) {
+        fprintf(stderr, "put: %s contains no regular files to transfer%s\n", root,
+                g_put_nexcludes ? " (after --exclude)" : "");
+        put_list_free();
+        return EXIT_OK;
+    }
+
+    if (!opts->json_output) {
+        fprintf(stderr, "put: %zu files, %llu bytes total, dest=%s\n",
+                g_put_count, (unsigned long long)g_put_total, remote_path);
+        if (g_put_skipped_nonreg)
+            fprintf(stderr, "put: skipped %d symlink/special entries (not followed)\n",
+                    g_put_skipped_nonreg);
+    }
+
+    /* The daemon creates missing parents when mkdir is set, and it is the only
+     * thing that can — so a directory put always implies it. */
+    int saved_mkdir = opts->put_mkdir;
+    opts->put_mkdir = 1;
+
+    int dir_rc = EXIT_OK;
+    size_t done = 0;
+    for (size_t i = 0; i < g_put_count; i++) {
+        char local_full[HL_PATH_MAX], remote_full[HL_PATH_MAX];
+        /* snprintf truncates silently, and a truncated path is a path to the
+         * WRONG file — the one class of bug this release exists to remove.
+         * Check both and say so plainly. */
+        int ln = snprintf(local_full,  sizeof(local_full),  "%s/%s", root, g_put_files[i].rel);
+        int rn = snprintf(remote_full, sizeof(remote_full), "%s/%s", remote_path, g_put_files[i].rel);
+        if (ln < 0 || (size_t)ln >= sizeof(local_full) ||
+            rn < 0 || (size_t)rn >= sizeof(remote_full)) {
+            fprintf(stderr,
+                    "put: path too long (limit %d bytes), stopping at: %s/%s\n"
+                    "     %zu of %zu files transferred\n",
+                    HL_PATH_MAX - 1, remote_path, g_put_files[i].rel, done, g_put_count);
+            dir_rc = EXIT_CLIENT_ERR;
+            break;
+        }
+
+        int use_stream = opts->stream ||
+                         g_put_files[i].size > HL_STREAM_AUTO_THRESHOLD;
+        int file_rc = use_stream
+                    ? cmd_put_stream(opts, local_full, remote_full)
+                    : cmd_put       (opts, local_full, remote_full);
+        if (file_rc != EXIT_OK) {
+            fprintf(stderr,
+                    "put: failed on %s (%zu of %zu transferred); stopping\n",
+                    g_put_files[i].rel, done, g_put_count);
+            dir_rc = file_rc;
+            break;
+        }
+        done++;
+    }
+
+    opts->put_mkdir = saved_mkdir;
+
+    if (dir_rc == EXIT_OK && !opts->json_output)
+        fprintf(stderr, "put: %zu files, %llu bytes -> %s\n",
+                done, (unsigned long long)g_put_total, remote_path);
+
+    put_list_free();
+    return dir_rc;
+}
+
 static int cmd_targets(cli_opts_t *opts, int do_ping) {
     const char *tf = find_targets_file(opts->targets_file);
     if (!tf) { fprintf(stderr, "No targets config found\n"); return EXIT_CLIENT_ERR; }
@@ -1301,10 +1549,39 @@ static int parse_two_path_args(cli_opts_t *opts, int argc, char *argv[], int fro
             opts->put_mode_val = (int)strtol(argv[++i], NULL, 8);
         } else if (!strncmp(a, "--mode=", 7)) {
             opts->put_mode_val = (int)strtol(a + 7, NULL, 8);
+        } else if (!strcmp(a, "--exclude")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --exclude requires a pattern\n", subcmd);
+                return -1;
+            }
+            if (opts->exclude_count >= HL_MAX_EXCLUDES) {
+                fprintf(stderr, "%s: too many --exclude patterns (max %d)\n",
+                        subcmd, HL_MAX_EXCLUDES);
+                return -1;
+            }
+            snprintf(opts->excludes[opts->exclude_count++],
+                     sizeof(opts->excludes[0]), "%s", argv[++i]);
+        } else if (!strncmp(a, "--exclude=", 10)) {
+            if (opts->exclude_count >= HL_MAX_EXCLUDES) {
+                fprintf(stderr, "%s: too many --exclude patterns (max %d)\n",
+                        subcmd, HL_MAX_EXCLUDES);
+                return -1;
+            }
+            snprintf(opts->excludes[opts->exclude_count++],
+                     sizeof(opts->excludes[0]), "%s", a + 10);
+        } else if (!strcmp(a, "-r") || !strcmp(a, "-R") ||
+                   !strcmp(a, "--recursive")) {
+            /* Fail loud rather than accept a flag that implies we might NOT
+             * recurse without it. Directories are always handled. */
+            fprintf(stderr,
+                    "%s: %s is not needed — directories are transferred "
+                    "automatically, as with `get`.\n", subcmd, a);
+            return -1;
         } else if (a[0] == '-' && a[1] != '\0' && strcmp(a, "-")) {
             fprintf(stderr,
                     "%s: unknown flag '%s'\n"
-                    "  transfer flags are: --mkdir, --mode <oct>, --stream\n"
+                    "  transfer flags are: --mkdir, --mode <oct>, --stream,\n"
+                    "                      --exclude <pattern>  (put of a directory)\n"
                     "  (connection flags such as -t/-k/-T go before the subcommand)\n",
                     subcmd, a);
             return -1;
@@ -1361,6 +1638,7 @@ int main(int argc, char *argv[]) {
         {"mkdir",          no_argument,       NULL, 1003},  /* NEW: mkdir -p on put */
         {"mode",           required_argument, NULL, 1004},  /* NEW: file mode on put */
         {"stream",         no_argument,       NULL, 1005},  /* NEW: streaming get/put (no 90 MiB cap) */
+        {"exclude",        required_argument, NULL, 1006},  /* NEW: skip glob on directory put */
         {NULL, 0, NULL, 0}
     };
 
@@ -1408,6 +1686,15 @@ int main(int argc, char *argv[]) {
             case 1003: opts.put_mkdir = 1; break;
             case 1004: opts.put_mode_val = (int)strtol(optarg, NULL, 8); break;
             case 1005: opts.stream = 1; break;
+            case 1006:
+                if (opts.exclude_count >= HL_MAX_EXCLUDES) {
+                    fprintf(stderr, "too many --exclude patterns (max %d)\n",
+                            HL_MAX_EXCLUDES);
+                    return EXIT_CLIENT_ERR;
+                }
+                snprintf(opts.excludes[opts.exclude_count++],
+                         sizeof(opts.excludes[0]), "%s", optarg);
+                break;
             case 'h':
                 printf("Usage: hostlink-cli [OPTIONS] <SUBCOMMAND>\n"
                        "Subcommands:\n"
@@ -1415,7 +1702,9 @@ int main(int argc, char *argv[]) {
                        "                              Remaining arguments are joined with\n"
                        "                              spaces; quote anything containing a\n"
                        "                              space, as with ssh.\n"
-                       "  put  <local> <remote>       Transfer a file (auto-streams if > 90 MiB)\n"
+                       "  put  <local> <remote>       Transfer a file or directory (auto-\n"
+                       "                              streams if > 90 MiB; directories are\n"
+                       "                              walked automatically, no -r needed)\n"
                        "  get  <remote> <local>       Retrieve a file or directory (auto-streams\n"
                        "                              large files; checks local free space first)\n"
                        "  put-stream <local> <remote> Force-stream a put (sha256-verified)\n"
@@ -1437,6 +1726,10 @@ int main(int argc, char *argv[]) {
                        "  -D, --detach   Fire-and-forget: return immediately, no output\n"
                        "  --mkdir        Create parent directories on put\n"
                        "  --mode <oct>   File permissions on put (default 644)\n"
+                       "  --exclude <p>  Skip paths matching glob <p> when putting a\n"
+                       "                 directory. Repeatable. Matches a basename, a full\n"
+                       "                 relative path, or any leading directory component,\n"
+                       "                 so --exclude .cache prunes the whole .cache/ tree.\n"
                        "  --stream       Force streaming protocol (sha256 verified) even for\n"
                        "                 small files. `get` and `put` already auto-stream when\n"
                        "                 the file is large; this flag is for verification.\n"
@@ -1496,19 +1789,23 @@ int main(int argc, char *argv[]) {
                                 &local_path, &remote_path) != 0) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        /* Auto-promote large puts to streaming. We can stat the local file
-         * cheaply, so we know the size up-front and avoid forcing the user
-         * to remember --stream for big files. */
-        int use_stream = opts.stream;
-        if (!use_stream) {
-            struct stat lst;
-            if (stat(local_path, &lst) == 0 &&
+        /* Directories are handled transparently, exactly as `get` does — no
+         * -r needed, and the two verbs stay symmetric. */
+        struct stat lst;
+        if (stat(local_path, &lst) == 0 && S_ISDIR(lst.st_mode)) {
+            rc = cmd_put_dir(&opts, local_path, remote_path);
+        } else {
+            /* Auto-promote large puts to streaming. We can stat the local file
+             * cheaply, so we know the size up-front and avoid forcing the user
+             * to remember --stream for big files. */
+            int use_stream = opts.stream;
+            if (!use_stream && stat(local_path, &lst) == 0 &&
                 (uint64_t)lst.st_size > HL_STREAM_AUTO_THRESHOLD)
                 use_stream = 1;
+            rc = use_stream
+                 ? cmd_put_stream(&opts, local_path, remote_path)
+                 : cmd_put       (&opts, local_path, remote_path);
         }
-        rc = use_stream
-             ? cmd_put_stream(&opts, local_path, remote_path)
-             : cmd_put       (&opts, local_path, remote_path);
     } else if (!strcmp(subcmd, "get")) {
         const char *remote_path, *local_path;
         if (parse_two_path_args(&opts, argc, argv, optind, "get",

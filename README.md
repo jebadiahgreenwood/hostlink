@@ -65,6 +65,10 @@ hostlink-cli -t dgx-spark -j exec "nvidia-smi"
 hostlink-cli -t desktop put ./f /srv/new/dir/f --mkdir
 hostlink-cli -t desktop put --mkdir ./f /srv/new/dir/f
 
+# Directories transfer in one command, in both directions — no -r
+hostlink-cli -t desktop put ./models /srv/models
+hostlink-cli -t desktop put ./models /srv/models --exclude .cache --exclude '*.tmp'
+
 # Ping
 hostlink-cli -t desktop ping
 
@@ -103,6 +107,43 @@ JSON output.
 > remote `exit 7` and a remote `false` were indistinguishable and callers
 > inspecting a specific status silently got the wrong answer. Transport errors
 > also moved from `2`–`7` into the reserved block.
+
+## Directory transfers
+
+`get` and `put` both handle directories transparently — there is no `-r`, and
+passing one is an error rather than a silent no-op. Semantics are cp-style and
+identical in both directions: `put ./foo /srv/bar` places files at
+`/srv/bar/<relative path>`.
+
+Both walk with `nftw(..., FTW_PHYS)` and transfer **regular files only**, so the
+two verbs always agree on what "the tree" is:
+
+- **Symlinks are not followed and not transferred** — no loops, and no surprise
+  copy of whatever a link happened to point at. Skipped entries are counted and
+  reported, not passed over silently.
+- **Empty directories are not recreated**, since only files move. This is a
+  shared limitation of both verbs, not an asymmetry.
+- Ceiling of 100,000 files per tree on each side; exceeding it is an error.
+- Files over 90 MiB stream automatically; `--stream` forces the sha256-verified
+  streaming path for every file, which doubles as a per-file integrity manifest.
+- A directory `put` always implies `--mkdir` — the daemon is the only thing that
+  can create the remote parents.
+- Transfers stop at the first failure, leaving what already landed in place so
+  you can see how far it got.
+
+`--exclude <glob>` (repeatable, `put` only) skips paths matching the glob. It
+matches a basename, a full relative path, or **any leading directory
+component** — so `--exclude .cache` prunes the entire `.cache/` subtree, which
+is what you want after a HuggingFace `--local-dir` download.
+
+> **New in 1.5.1.** `get` gained directory support in 1.4.0; `put` was strictly
+> one file until now, so shipping a tree meant a hand-written `find | while
+> read` loop plus pre-creating every nested subdirectory separately.
+>
+> One asymmetry remains: `get` checks local free space before starting
+> (`statvfs`), `put` cannot, because the daemon exposes no remote free-space
+> query. A `put` that fills the remote filesystem fails on the file that runs
+> out of room.
 
 ## Process-matching commands (`pgrep -f`, `pkill -f`)
 

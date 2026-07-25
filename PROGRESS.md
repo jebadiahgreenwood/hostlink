@@ -232,3 +232,53 @@ the recovery path):
    primary* — different units, no deadlock.
 2. **Old and new speak the same protocol,** so a mixed fleet is fine during a
    staged rollout (verified: 1.5.0 client against a 1.0.0 daemon).
+
+---
+
+## v1.5.1 — `put` reaches parity with `get` on directories (F3, 2026-07-25)
+
+`get` has handled directories transparently since 1.4.0. `put` was strictly one
+file, so shipping a tree meant a hand-written `find | while read` loop plus
+pre-creating every nested subdirectory by hand — 107 files for the Spark model
+transfer that first surfaced this, and 22 more when syncing this repo to Spark
+for the 1.5.0 build.
+
+`put <dir> <remote>` now walks and transfers the tree in one command. No `-r`:
+directories are handled automatically in both directions, and passing `-r` is a
+loud error rather than a silent no-op, so the flag can never imply that the
+default is non-recursive.
+
+**The walk deliberately mirrors the daemon's `get_stat` walk** — `nftw` with
+`FTW_PHYS`, regular files only, the same 100,000-file ceiling, the same
+relative-path derivation. The point is that `put` and `get` agree on what "the
+tree" is; a round-trip of the same tree is byte-identical and has the same file
+set, which the suite asserts directly.
+
+- Symlinks are not followed and not transferred, and skipped entries are
+  **counted and reported** rather than silently omitted.
+- Empty directories are not recreated (files-only transfer) — a limitation
+  shared with `get`, now documented rather than discovered.
+- A directory put always implies `--mkdir`; the daemon is the only thing that
+  can create remote parents.
+- Per-file streaming promotion above 90 MiB, as for single files. `--stream`
+  forces the sha256-verified path for every file, which is effectively the F5
+  verify manifest — each file reports its own digest.
+- Stops at the first failure, leaving transferred files in place, as `get` does.
+
+`--exclude <glob>` (repeatable, put only) matches a basename, a full relative
+path, or any leading directory component, so `--exclude .cache` prunes the whole
+subtree — the HuggingFace `--local-dir` case the plan called out.
+
+**Also fixed, same class as the 1.5.0 work:** composing `root + "/" + relative`
+into a fixed 1024-byte buffer with `snprintf` truncates silently, and a
+truncated path is a path to the *wrong file*. Both directions now use a
+4096-byte buffer and check for truncation explicitly, failing with "path too
+long" instead of transferring to a wrong or partial path. `get` had the same
+latent bug and was fixed alongside `put`.
+
+**Known remaining asymmetry:** `get` checks local free space before starting;
+`put` cannot, because the daemon exposes no remote free-space query. A `put`
+that fills the remote filesystem fails on the file that runs out of room.
+
+Suite: **95 assertions, 95/95 (bash), 94/94 (sh)**; 38/95 against the unpatched
+tree.
