@@ -753,6 +753,18 @@ static void handle_exec(int fd, cJSON *req) {
 
     exec_result_t r;
     memset(&r, 0, sizeof(r));
+
+    /* Fail loud rather than running a truncated command: snprintf would happily
+     * cut the tail off an oversized command and execute the fragment. */
+    if (strlen(cmd_j->valuestring) >= sizeof(r.command)) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "command too long: %zu bytes (max %zu)",
+                 strlen(cmd_j->valuestring), sizeof(r.command) - 1);
+        send_error(fd, req_id, "bad_request", msg);
+        return;
+    }
+
     snprintf(r.request_id,    sizeof(r.request_id),    "%s", req_id);
     snprintf(r.command,       sizeof(r.command),        "%s", cmd_j->valuestring);
     snprintf(r.shell,         sizeof(r.shell),          "%s", g_cfg->shell);

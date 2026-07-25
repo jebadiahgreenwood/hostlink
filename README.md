@@ -54,11 +54,16 @@ token = <your-token>
 ### Use
 
 ```bash
-# Execute a command
+# Execute a command — remaining arguments are joined, as with ssh
 hostlink-cli -t desktop exec "uname -a"
+hostlink-cli -t desktop exec stat -c%s /var/log/syslog
 
 # JSON output (for scripting/agents)
 hostlink-cli -t dgx-spark -j exec "nvidia-smi"
+
+# Transfer flags may go anywhere among the paths
+hostlink-cli -t desktop put ./f /srv/new/dir/f --mkdir
+hostlink-cli -t desktop put --mkdir ./f /srv/new/dir/f
 
 # Ping
 hostlink-cli -t desktop ping
@@ -69,16 +74,69 @@ hostlink-cli targets
 
 ## Client Exit Codes
 
+`exec` reports the **remote command's own exit status, verbatim**, so ordinary
+shell idioms work across the link:
+
+```bash
+hostlink-cli -t desktop exec "test -f /etc/fstab" && echo present
+hostlink-cli -t desktop exec "grep -q root /etc/passwd"; echo $?   # grep's own 0/1/2
+```
+
+Two values are reserved for hostlink's own failures, following the
+`timeout(1)`/`env(1)` convention, so they cannot be confused with a remote
+status:
+
 | Code | Meaning |
 |------|---------|
-| 0 | Success (remote exit code 0) |
-| 1 | Remote command exited non-zero |
-| 2 | Connection failed |
-| 3 | Authentication failed |
-| 4 | Bad request / server busy |
-| 5 | Command timed out |
-| 6 | Protocol error |
-| 7 | Client-side error |
+| 0 | Remote command succeeded |
+| 1–123, 126–255 | The remote command's own exit status (128+N if it died on signal N) |
+| 124 | Remote command hit the timeout and was killed |
+| 125 | HostLink itself failed: connection, authentication, protocol, or usage error |
+
+`put`/`get`/`ping`/`targets` have no remote status to pass through and report
+simply 0 (ok) or 125 (failed).
+
+Which transport failure occurred is on stderr, and machine-readably in `-j`
+JSON output.
+
+> **Changed in 1.5.0.** Previously every remote failure collapsed to `1`, so a
+> remote `exit 7` and a remote `false` were indistinguishable and callers
+> inspecting a specific status silently got the wrong answer. Transport errors
+> also moved from `2`–`7` into the reserved block.
+
+## Process-matching commands (`pgrep -f`, `pkill -f`)
+
+The command is delivered to the remote shell through the environment, not
+`argv`, so it never appears in the exec shell's `/proc/<pid>/cmdline`.
+
+> **Changed in 1.5.0.** Before this, the exec shell's command line *was* the
+> command text, so `pgrep -fc 'no_such_pattern'` returned 2, and `pkill -f
+> <pattern>` could match and kill its own session mid-command — which happened,
+> orphaning a server and leaving a port bound. The `[p]attern` trick does not
+> help, since the pattern still appears verbatim in the wrapper's command line.
+
+**This fixes the server side only.** The *client* still receives the pattern as
+a normal command-line argument, so `hostlink-cli`'s own `argv` contains it. If
+the client is visible in the target's process table — notably a container
+client against its own host, since the host's `/proc` shows container processes
+— those client processes still match. Measured on the reference deployment:
+matches went from 3 to 2, and the 2 remaining are the caller's own wrapper and
+client, not hostlink's server-side machinery.
+
+When the match has to be exact, keep the literal out of the command line:
+
+```bash
+# assemble the pattern on the remote side
+hostlink-cli -t desktop exec 'p=zzz_uni; pgrep -f "${p}que"'
+
+# or capture the PID at launch and match on that instead
+hostlink-cli -t desktop exec "kill $known_pid"
+
+# to inspect rather than kill: snapshot, then grep the FILE in a separate call,
+# so the reading command's own cmdline is not part of what is searched
+hostlink-cli -t desktop exec "ps -eo pid,args > /tmp/ps.txt"
+hostlink-cli -t desktop exec "grep some-pattern /tmp/ps.txt"
+```
 
 ## Docker Integration
 

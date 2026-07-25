@@ -28,19 +28,78 @@ static int make_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* Build environment: merge process env with requested overrides */
-static char **build_env(exec_result_t *r) {
+/*
+ * Command delivery: via the environment, not argv.
+ *
+ * The shell used to be exec'd as `sh -c "<command>"`, which put the command
+ * text into the child's /proc/<pid>/cmdline. Any pattern-matching process
+ * tool run *through* hostlink then matched hostlink's own exec shell:
+ *   hl "pgrep -fc 'zzz_no_such_pattern'"   ->  2
+ * That is not a cosmetic wart. `hl "pkill -f <pattern>"` matched and killed
+ * its own session (SIGTERM, exit 144), orphaning the process it had just
+ * started. The bracket trick ([p]attern) does not help, because the pattern
+ * still appears verbatim in the wrapper's command line.
+ *
+ * So the command travels in HOSTLINK_COMMAND and the shell runs a fixed stub.
+ * The stub copies it to a shell-local variable and unsets the exported one, so
+ * the command text is absent from cmdline *and* from every descendant's
+ * environ. What is left in cmdline is the constant stub, which matches nothing
+ * a caller would search for.
+ */
+#define HL_CMD_ENV   "HOSTLINK_COMMAND"
+#define HL_EVAL_STUB "__hl_c=\"$HOSTLINK_COMMAND\"; unset HOSTLINK_COMMAND; eval \"$__hl_c\""
+
+/*
+ * Hand the child a clean signal environment before exec.
+ *
+ * The daemon blocks SIGHUP/SIGINT/SIGTERM/SIGCHLD (it consumes them through a
+ * signalfd) and ignores SIGPIPE. A signal MASK survives both fork and execve,
+ * and a SIG_IGN disposition survives execve too — so without this, every
+ * command run over hostlink executed with those signals blocked or ignored,
+ * which is not what the same command does in any ordinary shell:
+ *
+ *   - `yes | head -1` did not die on SIGPIPE; the producer just kept going and
+ *     the pipeline reported success.
+ *   - a remote command could not be terminated by its own `kill -TERM $$`.
+ *   - worst, the timeout path below sends SIGTERM to the process group, which
+ *     the child was blocking — so every timeout ignored the graceful stop and
+ *     waited out the full 2 s escalation to SIGKILL.
+ *
+ * execve already resets caught signals to their default; it is specifically the
+ * mask and the ignored ones we have to undo by hand.
+ */
+static void reset_child_signals(void) {
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT,  SIG_DFL);
+    signal(SIGHUP,  SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
+}
+
+/* Build environment: merge process env with requested overrides, and append
+ * HOSTLINK_COMMAND. Returns the count of heap-allocated entries (which the
+ * caller must pass to free_env) via *heap_out. */
+static char **build_env(exec_result_t *r, int *heap_out) {
     extern char **environ;
     int base_count = 0;
     while (environ[base_count]) base_count++;
 
-    char **env = malloc(sizeof(char *) * (size_t)(base_count + r->env_count + 1));
-    if (!env) return NULL;
+    /* +1 slot for HOSTLINK_COMMAND, +1 for the NULL terminator */
+    char **env = malloc(sizeof(char *) * (size_t)(base_count + r->env_count + 2));
+    if (!env) { if (heap_out) *heap_out = 0; return NULL; }
 
-    int out = 0;
+    int out = 0, heap = 0;
     for (int i = 0; i < base_count; i++) {
         int skip = 0;
-        for (int j = 0; j < r->env_count; j++) {
+        /* a caller-supplied HOSTLINK_COMMAND would be shadowed anyway, but drop
+         * any inherited one so the stub can never pick up a stale value */
+        if (strncmp(environ[i], HL_CMD_ENV "=", sizeof(HL_CMD_ENV)) == 0)
+            skip = 1;
+        for (int j = 0; !skip && j < r->env_count; j++) {
             size_t klen = strlen(r->env_keys[j]);
             if (strncmp(environ[i], r->env_keys[j], klen) == 0 &&
                 environ[i][klen] == '=') {
@@ -52,25 +111,36 @@ static char **build_env(exec_result_t *r) {
     for (int j = 0; j < r->env_count; j++) {
         char *kv;
         if (asprintf(&kv, "%s=%s", r->env_keys[j], r->env_vals[j]) < 0) {
+            for (int k = out - heap; k < out; k++) free(env[k]);
             free(env);
+            if (heap_out) *heap_out = 0;
             return NULL;
         }
-        env[out++] = kv;
+        env[out++] = kv; heap++;
+    }
+    {
+        char *kv;
+        if (asprintf(&kv, "%s=%s", HL_CMD_ENV, r->command) < 0) {
+            for (int k = out - heap; k < out; k++) free(env[k]);
+            free(env);
+            if (heap_out) *heap_out = 0;
+            return NULL;
+        }
+        env[out++] = kv; heap++;
     }
     env[out] = NULL;
+    if (heap_out) *heap_out = heap;
     return env;
 }
 
-static void free_env(char **env, int env_count) {
+static void free_env(char **env, int heap_count) {
     if (!env) return;
     int total = 0;
     while (env[total]) total++;
-    for (int i = total - env_count; i < total; i++)
+    for (int i = total - heap_count; i < total; i++)
         free(env[i]);
     free(env);
 }
-
-static char *s_empty_env[] = { NULL };
 
 /* ── Detach path: double-fork so grandchild is owned by init ─────────── */
 static void executor_run_detach(exec_result_t *r) {
@@ -84,14 +154,23 @@ static void executor_run_detach(exec_result_t *r) {
         return;
     }
 
-    char **env = build_env(r);
+    int env_heap = 0;
+    char **env = build_env(r, &env_heap);
+    if (!env) {
+        /* Without the environment the stub has no command to eval — fail loud
+         * rather than silently running nothing. */
+        snprintf(r->error_msg, sizeof(r->error_msg), "out of memory building environment");
+        r->exec_error = 1;
+        r->duration_ms = 0;
+        return;
+    }
 
     /* First fork */
     pid_t pid = fork();
     if (pid < 0) {
         snprintf(r->error_msg, sizeof(r->error_msg), "fork: %s", strerror(errno));
         r->exec_error = 1;
-        free_env(env, r->env_count);
+        free_env(env, env_heap);
         r->duration_ms = 0;
         return;
     }
@@ -113,14 +192,14 @@ static void executor_run_detach(exec_result_t *r) {
         for (int fd2 = 3; fd2 < 1024; fd2++) close(fd2);
         if (r->workdir[0] != '\0') { int _cd = chdir(r->workdir); (void)_cd; }
 
-        char *argv_child[4] = { r->shell, "-c", r->command, NULL };
-        char **use_env = env ? env : s_empty_env;
-        execve(r->shell, argv_child, use_env);
+        reset_child_signals();
+        char *argv_child[4] = { r->shell, "-c", (char *)HL_EVAL_STUB, NULL };
+        execve(r->shell, argv_child, env);
         _exit(126);
     }
 
     /* Parent: wait on intermediate only (it exits quickly) */
-    free_env(env, r->env_count);
+    free_env(env, env_heap);
     int wstatus = 0;
     waitpid(pid, &wstatus, 0);
 
@@ -205,7 +284,18 @@ void executor_run(exec_result_t *r) {
         return;
     }
 
-    char **env = build_env(r);
+    int env_heap = 0;
+    char **env = build_env(r, &env_heap);
+    if (!env) {
+        snprintf(r->error_msg, sizeof(r->error_msg), "out of memory building environment");
+        r->exec_error = 1;
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); close(stderr_pipe[1]);
+        if (out_fd >= 0) close(out_fd);
+        if (err_fd >= 0) close(err_fd);
+        r->duration_ms = 0;
+        return;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -215,7 +305,7 @@ void executor_run(exec_result_t *r) {
         close(stderr_pipe[0]); close(stderr_pipe[1]);
         if (out_fd >= 0) close(out_fd);
         if (err_fd >= 0) close(err_fd);
-        free_env(env, r->env_count);
+        free_env(env, env_heap);
         r->duration_ms = 0;
         return;
     }
@@ -233,13 +323,13 @@ void executor_run(exec_result_t *r) {
                 _exit(126);
             }
         }
+        reset_child_signals();
         char *argv_child[4];
         argv_child[0] = r->shell;
         argv_child[1] = "-c";
-        argv_child[2] = r->command;
+        argv_child[2] = (char *)HL_EVAL_STUB;
         argv_child[3] = NULL;
-        char **use_env = env ? env : s_empty_env;
-        execve(r->shell, argv_child, use_env);
+        execve(r->shell, argv_child, env);
         fprintf(stderr, "execve failed: %s\n", strerror(errno));
         _exit(126);
     }
@@ -249,7 +339,7 @@ void executor_run(exec_result_t *r) {
     close(stderr_pipe[1]);
     if (out_fd >= 0) close(out_fd);
     if (err_fd >= 0) close(err_fd);
-    free_env(env, r->env_count);
+    free_env(env, env_heap);
 
     make_nonblocking(stdout_pipe[0]);
     make_nonblocking(stderr_pipe[0]);

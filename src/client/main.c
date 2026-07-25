@@ -18,16 +18,39 @@
 #include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.4.0"
+#define VERSION "1.5.0"
 
-#define EXIT_OK           0
+/*
+ * Exit codes — ssh's model, for the same reason ssh uses it.
+ *
+ * `exec` exits with the REMOTE command's status, verbatim, so that the
+ * ordinary shell idioms work across the link:
+ *     hl "test -f /x" && hl "do-thing"
+ *     hl "grep -q pat file"; case $? in 0) ;; 1) ;; esac
+ * Before 1.5.0 every remote failure collapsed to 1, so a remote `exit 7` and a
+ * remote `false` were indistinguishable, and any caller inspecting a specific
+ * status (grep's 1-vs-2, diff's 1-vs-2) silently got the wrong answer.
+ *
+ * hostlink's OWN failures — it never got as far as running your command — live
+ * in a reserved high block so they cannot be mistaken for a remote status.
+ * 124/125 follow the GNU timeout(1)/env(1) convention.
+ *
+ * Distinguishing *which* transport failure occurred is still available on
+ * stderr and, machine-readably, in `-j` JSON output.
+ */
+#define EXIT_OK           0    /* remote command succeeded */
+                               /* 1..123, 126..255: remote command's own status */
+#define EXIT_TIMEOUT      124  /* remote command was killed at the timeout */
+#define EXIT_HOSTLINK_ERR 125  /* hostlink itself failed: connect/auth/protocol/usage */
+
+/* Retained for the non-exec subcommands (put/get/ping/targets), where there is
+ * no remote status to pass through and a plain pass/fail is the whole story. */
 #define EXIT_REMOTE_ERR   1
-#define EXIT_CONN_FAILED  2
-#define EXIT_AUTH_FAILED  3
-#define EXIT_BAD_REQUEST  4
-#define EXIT_TIMEOUT      5
-#define EXIT_PROTO_ERR    6
-#define EXIT_CLIENT_ERR   7
+#define EXIT_CONN_FAILED  EXIT_HOSTLINK_ERR
+#define EXIT_AUTH_FAILED  EXIT_HOSTLINK_ERR
+#define EXIT_BAD_REQUEST  EXIT_HOSTLINK_ERR
+#define EXIT_PROTO_ERR    EXIT_HOSTLINK_ERR
+#define EXIT_CLIENT_ERR   EXIT_HOSTLINK_ERR
 
 typedef struct {
     char  target[64];
@@ -252,14 +275,46 @@ static int cmd_exec(cli_opts_t *opts, const char *command) {
     int ret = EXIT_OK;
     if (!strcmp(status, "auth_failed")) {
         fprintf(stderr, "Authentication failed\n"); ret = EXIT_AUTH_FAILED;
-    } else if (!strcmp(status, "error")) {
-        fprintf(stderr, "[%s] error: %s\n", node, error_msg ? error_msg : "unknown");
+    } else if (strcmp(status, "ok") && strcmp(status, "timeout")) {
+        /* Anything that is not "ok" or "timeout" is a failure. This used to
+         * test only for status=="error", so the daemon's *other* rejection
+         * status — "bad_request", which it sends for a missing or malformed
+         * command — fell through to the success branch and was reported to the
+         * caller as `exit=0`. An unrecognised future status now also fails
+         * closed rather than being read as success. */
+        fprintf(stderr, "[%s] %s: %s\n", node, status,
+                error_msg ? error_msg : "unknown");
         ret = EXIT_BAD_REQUEST;
     } else if (!strcmp(status, "timeout")) {
         fprintf(stderr, "[%s] timeout after %.0fms\n", node, duration);
+        /* Whatever the command managed to produce before it was killed is
+         * already in the response — the daemon buffers it either way. Printing
+         * it costs nothing and is often the only record of how far a long build
+         * got, which previously had to be recovered by redirecting to a file
+         * inside the command itself. */
+        if (stdout_file || stderr_file) {
+            if (stdout_file) fprintf(stderr, "[%s] partial stdout:%s\n", node, stdout_file);
+            if (stderr_file) fprintf(stderr, "[%s] partial stderr:%s\n", node, stderr_file);
+        } else {
+            if (stdout_str && *stdout_str) fputs(stdout_str, stdout);
+            if (stderr_str && *stderr_str) fputs(stderr_str, stderr);
+        }
         ret = EXIT_TIMEOUT;
     } else {
-        if (exit_code != 0) ret = EXIT_REMOTE_ERR;
+        /* Pass the remote status through verbatim (see the exit-code comment at
+         * the top of this file). Guard the reserved block and the daemon's
+         * negative sentinels so they can never be forged by a remote status. */
+        if (exit_code < 0) {
+            ret = EXIT_HOSTLINK_ERR;
+        } else if (exit_code == EXIT_TIMEOUT || exit_code == EXIT_HOSTLINK_ERR) {
+            /* a genuine remote 124/125 — report it, but say so, since these two
+             * values otherwise mean "hostlink failed" */
+            fprintf(stderr, "[%s] note: remote exited %d, which collides with "
+                            "hostlink's reserved range\n", node, exit_code);
+            ret = exit_code;
+        } else {
+            ret = exit_code > 255 ? 255 : exit_code;
+        }
         /* detached — just print a brief ack */
         j = cJSON_GetObjectItem(resp, "detached");
         if (cJSON_IsTrue(j)) {
@@ -1178,6 +1233,100 @@ static int cmd_targets(cli_opts_t *opts, int do_ping) {
     return EXIT_OK;
 }
 
+/*
+ * Join argv[from..argc-1] with single spaces into a newly allocated string.
+ *
+ * `exec` used to run only argv[optind] and silently discard the rest, so
+ * `hostlink-cli ... exec stat -c%s /path` ran a bare `stat`, and
+ * `exec ls /some/dir` listed `/`. That produced a false "all files MISSING"
+ * report after a transfer that had in fact fully succeeded. The wrappers
+ * (bin/hl, bin/hl-spark) were immune only because they pre-join into one token,
+ * so join-of-one here is the identity and they are unaffected.
+ *
+ * The daemon shell-parses the joined string, so — exactly as with ssh — an
+ * argument containing spaces must be quoted by the caller to survive.
+ */
+static char *join_argv(int argc, char *argv[], int from) {
+    size_t total = 1;
+    for (int i = from; i < argc; i++) total += strlen(argv[i]) + 1;
+
+    char *out = malloc(total);
+    if (!out) return NULL;
+
+    size_t pos = 0;
+    for (int i = from; i < argc; i++) {
+        if (i > from) out[pos++] = ' ';
+        size_t len = strlen(argv[i]);
+        memcpy(out + pos, argv[i], len);
+        pos += len;
+    }
+    out[pos] = '\0';
+    return out;
+}
+
+/*
+ * Split the arguments of a two-path subcommand (put/get and their -stream
+ * variants) into exactly two positionals plus any transfer flags, accepting the
+ * flags in ANY position.
+ *
+ * getopt is invoked with a leading '+' so it stops at the first non-option —
+ * the subcommand itself. Everything after it was therefore read positionally,
+ * so both of these silently did the wrong thing:
+ *     put <local> <remote> --mkdir     -> --mkdir ignored, never sent
+ *     put --mkdir <local> <remote>     -> "--mkdir" taken as the local path
+ * The daemon implements nested mkdir correctly; it was simply never asked.
+ * Top-level puts appeared to work only because their parents already existed.
+ *
+ * Returns 0 on success, -1 on an unknown flag or the wrong number of paths —
+ * it never ignores a token it did not understand.
+ */
+static int parse_two_path_args(cli_opts_t *opts, int argc, char *argv[], int from,
+                               const char *subcmd, const char *p1_name,
+                               const char *p2_name,
+                               const char **out_p1, const char **out_p2) {
+    const char *pos[2] = { NULL, NULL };
+    int npos = 0;
+
+    for (int i = from; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--mkdir")) {
+            opts->put_mkdir = 1;
+        } else if (!strcmp(a, "--stream")) {
+            opts->stream = 1;
+        } else if (!strcmp(a, "--mode")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --mode requires an octal argument\n", subcmd);
+                return -1;
+            }
+            opts->put_mode_val = (int)strtol(argv[++i], NULL, 8);
+        } else if (!strncmp(a, "--mode=", 7)) {
+            opts->put_mode_val = (int)strtol(a + 7, NULL, 8);
+        } else if (a[0] == '-' && a[1] != '\0' && strcmp(a, "-")) {
+            fprintf(stderr,
+                    "%s: unknown flag '%s'\n"
+                    "  transfer flags are: --mkdir, --mode <oct>, --stream\n"
+                    "  (connection flags such as -t/-k/-T go before the subcommand)\n",
+                    subcmd, a);
+            return -1;
+        } else if (npos < 2) {
+            pos[npos++] = a;
+        } else {
+            fprintf(stderr,
+                    "%s: too many paths — expected <%s> <%s>, got a third: '%s'\n",
+                    subcmd, p1_name, p2_name, a);
+            return -1;
+        }
+    }
+
+    if (npos < 2) {
+        fprintf(stderr, "%s requires: <%s> <%s>\n", subcmd, p1_name, p2_name);
+        return -1;
+    }
+    *out_p1 = pos[0];
+    *out_p2 = pos[1];
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     log_init(LOG_TARGET_STDERR, HL_LOG_WARN, NULL);
 
@@ -1262,7 +1411,10 @@ int main(int argc, char *argv[]) {
             case 'h':
                 printf("Usage: hostlink-cli [OPTIONS] <SUBCOMMAND>\n"
                        "Subcommands:\n"
-                       "  exec <cmd>                  Run a command on the remote host\n"
+                       "  exec <cmd...>               Run a command on the remote host.\n"
+                       "                              Remaining arguments are joined with\n"
+                       "                              spaces; quote anything containing a\n"
+                       "                              space, as with ssh.\n"
                        "  put  <local> <remote>       Transfer a file (auto-streams if > 90 MiB)\n"
                        "  get  <remote> <local>       Retrieve a file or directory (auto-streams\n"
                        "                              large files; checks local free space first)\n"
@@ -1288,7 +1440,18 @@ int main(int argc, char *argv[]) {
                        "  --stream       Force streaming protocol (sha256 verified) even for\n"
                        "                 small files. `get` and `put` already auto-stream when\n"
                        "                 the file is large; this flag is for verification.\n"
-                       "  --targets-file <path>  Override targets config path\n");
+                       "  --targets-file <path>  Override targets config path\n"
+                       "\n"
+                       "Exit status (exec):\n"
+                       "  The remote command's own status, passed through verbatim, so\n"
+                       "  `hostlink-cli ... exec 'test -f /x' && ...` behaves as expected.\n"
+                       "  124  remote command hit the timeout and was killed\n"
+                       "  125  hostlink itself failed (connect / auth / protocol / usage)\n"
+                       "  put/get/ping/targets report a plain 0 = ok, 125 = failed.\n"
+                       "\n"
+                       "Note: the command is delivered to the remote shell through the\n"
+                       "  environment, not argv, so `pgrep -f` / `pkill -f` run over\n"
+                       "  hostlink no longer match hostlink's own exec shell.\n");
                 return EXIT_OK;
             case 'V': printf("hostlink-cli %s\n", VERSION); return EXIT_OK;
             default:  return EXIT_CLIENT_ERR;
@@ -1319,13 +1482,20 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "exec requires a command argument\n");
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        rc = cmd_exec(&opts, argv[optind]);
-    } else if (!strcmp(subcmd, "put")) {
-        if (optind + 1 >= argc) {
-            fprintf(stderr, "put requires: <local_path> <remote_path>\n");
+        char *command = join_argv(argc, argv, optind);
+        if (!command) {
+            fprintf(stderr, "out of memory building command\n");
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        const char *local_path = argv[optind];
+        rc = cmd_exec(&opts, command);
+        free(command);
+    } else if (!strcmp(subcmd, "put")) {
+        const char *local_path, *remote_path;
+        if (parse_two_path_args(&opts, argc, argv, optind, "put",
+                                "local_path", "remote_path",
+                                &local_path, &remote_path) != 0) {
+            targets_free(all_targets); return EXIT_CLIENT_ERR;
+        }
         /* Auto-promote large puts to streaming. We can stat the local file
          * cheaply, so we know the size up-front and avoid forcing the user
          * to remember --stream for big files. */
@@ -1337,30 +1507,36 @@ int main(int argc, char *argv[]) {
                 use_stream = 1;
         }
         rc = use_stream
-             ? cmd_put_stream(&opts, local_path, argv[optind + 1])
-             : cmd_put       (&opts, local_path, argv[optind + 1]);
+             ? cmd_put_stream(&opts, local_path, remote_path)
+             : cmd_put       (&opts, local_path, remote_path);
     } else if (!strcmp(subcmd, "get")) {
-        if (optind + 1 >= argc) {
-            fprintf(stderr, "get requires: <remote_path> <local_path>\n");
+        const char *remote_path, *local_path;
+        if (parse_two_path_args(&opts, argc, argv, optind, "get",
+                                "remote_path", "local_path",
+                                &remote_path, &local_path) != 0) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
         /* Smart dispatcher: probes remote size with get_stat, checks local
          * free space, then routes to legacy or streaming per-file. Handles
          * directories transparently (cp-style: local path becomes the new
          * directory). --stream still works as an explicit override. */
-        rc = cmd_get_smart(&opts, argv[optind], argv[optind + 1]);
+        rc = cmd_get_smart(&opts, remote_path, local_path);
     } else if (!strcmp(subcmd, "get-stream") || !strcmp(subcmd, "get_stream")) {
-        if (optind + 1 >= argc) {
-            fprintf(stderr, "get-stream requires: <remote_path> <local_path>\n");
+        const char *remote_path, *local_path;
+        if (parse_two_path_args(&opts, argc, argv, optind, "get-stream",
+                                "remote_path", "local_path",
+                                &remote_path, &local_path) != 0) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        rc = cmd_get_stream(&opts, argv[optind], argv[optind + 1]);
+        rc = cmd_get_stream(&opts, remote_path, local_path);
     } else if (!strcmp(subcmd, "put-stream") || !strcmp(subcmd, "put_stream")) {
-        if (optind + 1 >= argc) {
-            fprintf(stderr, "put-stream requires: <local_path> <remote_path>\n");
+        const char *local_path, *remote_path;
+        if (parse_two_path_args(&opts, argc, argv, optind, "put-stream",
+                                "local_path", "remote_path",
+                                &local_path, &remote_path) != 0) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
-        rc = cmd_put_stream(&opts, argv[optind], argv[optind + 1]);
+        rc = cmd_put_stream(&opts, local_path, remote_path);
     } else if (!strcmp(subcmd, "targets")) {
         rc = cmd_targets(&opts, do_ping_targets);
     } else {

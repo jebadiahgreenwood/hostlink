@@ -20,7 +20,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 
-#define VERSION "1.0.0"
+#define VERSION "1.5.0"
 #define DEFAULT_CONFIG "/etc/hostlink/hostlink.conf"
 #define PID_FILE "/run/hostlink/hostlink.pid"
 

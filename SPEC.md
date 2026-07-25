@@ -252,7 +252,13 @@ Single-threaded epoll event loop + `fork()` for command execution:
 1. Resolve effective limits: `eff_max_stdout = min(request.max_stdout_bytes or default, config.max_output_bytes)`. If `max_output_bytes` = 0, no clamping.
 2. If `output_to_file`: create `hl_<id>_stdout` and `hl_<id>_stderr` in `output_tmpdir` (permissions 0600). Create dir if missing; error if creation fails.
 3. Create stdout/stderr pipes. Fork.
-4. **Child:** redirect stdout/stderr, close excess fds, set workdir, merge env, `execve(shell, [shell, "-c", command], env)`. On execve fail: write error, `_exit(126)`.
+4. **Child:** redirect stdout/stderr, close excess fds, set workdir, merge env, **restore default signal dispositions and clear the inherited signal mask**, then `execve(shell, [shell, "-c", <fixed stub>], env)` where the environment carries `HOSTLINK_COMMAND` and the stub is
+   `__hl_c="$HOSTLINK_COMMAND"; unset HOSTLINK_COMMAND; eval "$__hl_c"`.
+   On execve fail: write error, `_exit(126)`.
+
+   Two deliberate properties (both since 1.5.0):
+   - **The command is not in `argv`,** so it never appears in the exec shell's `/proc/<pid>/cmdline` and `pgrep -f`/`pkill -f` run *through* hostlink cannot match hostlink's own server-side shell. The stub unsets the variable before `eval`, so the text is absent from descendants' environments too. Note this covers the server side only — the client still takes the command as ordinary `argv`, so a client visible in the target's process table (e.g. a container client against its own host) still matches itself. See README § *Process-matching commands*.
+   - **Signal state is reset.** The daemon blocks `SIGHUP`/`SIGINT`/`SIGTERM`/`SIGCHLD` (signalfd) and ignores `SIGPIPE`; a signal mask survives `fork`+`execve` and `SIG_IGN` survives `execve`, so without an explicit reset every remote command ran with those signals blocked — `yes | head -1` would not die on `SIGPIPE`, and the timeout's `SIGTERM` in step 7 was itself blocked, forcing every timeout through the full 2 s escalation to `SIGKILL`.
 5. **Parent (inline mode):** read into dynamic buffers. Track `original_bytes`. When buffer exceeds limit, drain pipe but stop appending, set `truncated=true`. Trim final buffer to exactly the limit.
 6. **Parent (file mode):** write all data to temp files. No truncation. Track `original_bytes`. `truncated=false`.
 7. Timer for `timeout_ms`: on timeout → SIGTERM to process group → wait 2s → SIGKILL → status `"timeout"`, exit_code `-2`.
@@ -354,16 +360,26 @@ dgx-spark-02 tcp 10.0.0.3:9876              unreachable
 
 ### 5.3 Exit Codes
 
-| Code | Meaning                                          |
-|------|--------------------------------------------------|
-| 0    | Success, remote exit code was 0.                 |
-| 1    | Command ran but remote exit code was non-zero.   |
-| 2    | Connection failed.                               |
-| 3    | Authentication failed.                           |
-| 4    | Request rejected (bad request / server busy).    |
-| 5    | Command timed out on remote side.                |
-| 6    | Protocol error.                                  |
-| 7    | Client-side error (bad args, missing config).    |
+`exec` passes the remote command's status through verbatim (ssh's model), so
+that `&&`, `||` and `$?` inspection work across the link. HostLink's own
+failures occupy a reserved block that a remote status is unlikely to collide
+with, following the `timeout(1)` / `env(1)` convention.
+
+| Code           | Meaning                                                          |
+|----------------|------------------------------------------------------------------|
+| 0              | Remote command exited 0.                                          |
+| 1–123, 126–255 | The remote command's own exit status (128+N if killed by signal N).|
+| 124            | Remote command exceeded `timeout_ms` and was killed.              |
+| 125            | HostLink itself failed: connection, authentication, protocol error, bad request, or client-side usage error. |
+
+If a remote command genuinely exits 124 or 125, the client passes it through
+and notes the collision on stderr.
+
+`put`, `get`, `ping` and `targets` carry no remote status; they report 0 on
+success and 125 on failure.
+
+**Changed in 1.5.0.** Previously all remote non-zero statuses collapsed to `1`
+and transport failures occupied `2`–`7`.
 
 ### 5.4 Output Format
 
