@@ -282,3 +282,123 @@ that fills the remote filesystem fails on the file that runs out of room.
 
 Suite: **95 assertions, 95/95 (bash), 94/94 (sh)**; 38/95 against the unpatched
 tree.
+
+---
+
+## v1.6.0 — jobs, per-target patience, verified transfers (2026-07-26)
+
+Closes the whole remaining backlog from `NEXT_HOSTLINK_CLI_UPGRADE.md`: F6.1
+(job API), F6.2 (per-target default timeout), F5 (verify manifest), F6.5 (git
+across mounts), and the remote free-space asymmetry left open by 1.5.1.
+
+### F6.1 — detached jobs
+
+`--detach` existed and worked, but it was a one-way door: no id, no output, no
+exit status. The documented workaround — redirect to a file inside the command
+and poll it — was the friction F6 was filed about in the first place.
+
+Now every detached command becomes a **job**: an id on stdout, output spooled on
+the far side, and `job status | tail | wait | cancel | list` to read it back.
+
+**The registry is a directory, not a table.** The daemon forks a worker per
+request and answers from that child, so there is no process in which an
+in-memory job table would be visible both to the running job and to the client
+asking about it. Shared memory would fix that and lose everything on restart.
+`<output_tmpdir>/jobs/<id>/` is what both sides can see — and what survives the
+daemon. Verified directly: a job kept running across a daemon restart, wrote its
+status, and the *new* daemon read it back.
+
+**Three forks, each earning its keep.** `daemon → A → B(supervisor) → C(shell)`.
+A exists so the daemon never waits on a long job, and because A is the only
+process that knows B's pid — which the registry needs to answer "is it still
+running". B exists so something observes C's exit: a grandchild reparented to
+init, as plain `--detach` produces, dies unwitnessed. B reuses `executor_run`
+rather than reimplementing the wait, so the pipe draining, the output cap, the
+timeout, the process-group kill and the signal hygiene are the same code that
+was already correct — not a second copy to rot.
+
+**Design decisions worth keeping:**
+
+- **Ids come from the daemon**, twelve hex characters, validated on every
+  request before they touch a path. A client-chosen id would make `--job
+  ../../etc` a directory traversal and let two clients collide.
+- **`wait` polls from the client.** A server-side wait would hold a forked
+  worker for the life of the job; with `max_concurrent_io` defaulting to 4, four
+  waiters would lock every transfer out of the daemon. Polling cannot exhaust
+  anything and keeps working across a restart.
+- **`tail` is offset-based**, so `-f` sends only what is new.
+- **`lost` is a state.** If the supervisor is gone and wrote no status — which
+  is what `systemctl restart` does, since setsid does not leave the cgroup —
+  the exit code is unknowable. Saying `running` forever would be a lie. pid
+  *and* `/proc/<pid>/stat` start time are compared, so a recycled pid cannot
+  make a dead job look alive.
+- **The spool is capped** (`job_max_spool_bytes`, per stream). Past the cap the
+  supervisor keeps draining the pipe — stopping the read would block the
+  command on a full pipe and turn a big log into a hang — and reports how much
+  was produced. `output_tmpdir` is often a tmpfs, so this is a RAM ceiling.
+- **Finished spools are swept** after `job_retention_s`, opportunistically at
+  submission, bounded to 512 directories per sweep so a backlog is cleared over
+  several submissions instead of stalling one on the event loop.
+- **`cancel` signals the process group**, which is why `executor_run` now
+  records the child's pid. Without it the only way to stop a runaway job over
+  the link would be `pkill -f` — exactly the footgun F8 exists to steer people
+  away from.
+
+A pre-1.6.0 client sending `detach:true` gets a `job_id` field it ignores;
+a 1.6.0 client against an older daemon says so plainly instead of failing
+obscurely.
+
+### F6.2 — per-target default timeout
+
+`timeout_ms` in a `targets.conf` section. The right patience is a property of
+the target, not the caller: `bin/hl-lab` had been injecting `-T 600000` for
+exactly this reason, and that hack is now deleted in favour of one line of
+config that the raw client honours too. An explicit `-T` still wins.
+
+**Found while there:** the daemon clamps `-T` to its own `max_timeout_ms` and
+did it in silence — ask for ten minutes against a daemon capped at five and the
+command dies at five reporting a plain timeout, with nothing admitting the
+request was overruled. Same fail-silent class as F1/F2. The response now carries
+the requested and effective values and the client warns.
+
+### F5 — verify manifest
+
+`put <dir> --verify` forces every file down the streaming path (the only one
+that hashes), prints a `sha256sum`-format manifest to stdout, and ends with
+"N of N files sha256-verified by the remote". A short count means the loop
+stopped early. `--verify` is separate from `--stream` because a manifest built
+from the base64 path would be a list of digests nobody checked.
+
+### Remote free space — the 1.5.1 asymmetry, closed
+
+New `stat_fs` request: `statvfs` of the filesystem that would hold a path,
+walking up to the **nearest existing ancestor** — the normal case for a put is a
+destination that does not exist yet. A directory put now checks before the first
+byte instead of failing on whichever file exhausts the far side. Surfaced as
+`hostlink-cli df <remote>`, which makes the check observable and testable rather
+than a hidden branch. A daemon that cannot answer means no check, exactly as
+before — a capability probe must never be what stops a transfer.
+
+### F6.5 — git across mounts
+
+`bin/hl-lab` exports `GIT_DISCOVERY_ACROSS_FILESYSTEM=1` on every command.
+
+### Tests
+
+Suite: **142 assertions, 142/142 (bash), 141/141 (sh)** — the one difference is
+a pre-existing shell-dependent SIGPIPE assertion, not one of the new ones.
+Against the unpatched 1.5.1 tree: **109/142**, so 33 assertions are genuinely
+exercising the new behaviour rather than passing either way.
+
+Three failures on the first full run were worth more than the passes:
+
+1. **A use-after-free I had just written.** `job_request` deleted the cJSON tree
+   and *then* compared the status string that pointed into it, so "no such job"
+   came back as a transport error about a third of the time. Only the test that
+   asserted the specific exit code caught it.
+2. **`pipefail` again.** `hl job status | grep -q CAPPED` reported failure
+   because the pipeline inherits `hl`'s status, and that job had exited 5. The
+   same trap as last release; the assertion now captures and matches instead.
+3. **`HOSTLINK_TOKEN` in the environment** silently overrides every per-target
+   token — the pitfall the `bin/` wrappers all guard with `env -u`. The
+   targets-file tests now do the same.

@@ -70,6 +70,10 @@ void daemon_config_defaults(daemon_config_t *cfg) {
     cfg->default_max_output_bytes = 4194304LL;
     cfg->max_output_bytes         = 67108864LL;
     snprintf(cfg->output_tmpdir, sizeof(cfg->output_tmpdir), "%s", "/run/hostlink/output");
+    cfg->job_default_timeout_ms = 86400000;          /* 24 h  */
+    cfg->job_max_timeout_ms     = 604800000;         /* 7 d   */
+    cfg->job_max_spool_bytes    = 268435456LL;       /* 256 MiB per stream */
+    cfg->job_retention_s        = 86400;             /* 24 h  */
     snprintf(cfg->log_target, sizeof(cfg->log_target), "%s", "stderr");
     snprintf(cfg->log_level, sizeof(cfg->log_level), "%s", "info");
 }
@@ -87,6 +91,10 @@ static void daemon_cfg_cb(const char *section, const char *key,
     BOOL(unix_enabled) BOOL(tcp_enabled) INT(tcp_port)
     INT(max_concurrent) INT(max_concurrent_io)
     INT(default_timeout_ms) INT(max_timeout_ms)
+    INT(job_default_timeout_ms) INT(job_max_timeout_ms) INT(job_retention_s)
+    if (!strcmp(key, "job_max_spool_bytes")) {
+        cfg->job_max_spool_bytes = atoll(value); return;
+    }
     if (!strcmp(key, "unix_mode")) {
         cfg->unix_mode = (int)strtol(value, NULL, 8); return;
     }
@@ -139,6 +147,7 @@ static void targets_cb(const char *section, const char *key,
     else if (!strcmp(key, "address")) snprintf(e->address,   sizeof(e->address),   "%s", value);
     else if (!strcmp(key, "port"))    e->port = atoi(value);
     else if (!strcmp(key, "token"))   snprintf(e->token,     sizeof(e->token),     "%s", value);
+    else if (!strcmp(key, "timeout_ms")) e->timeout_ms = atoi(value);
 }
 
 /* Reverse a linked list */

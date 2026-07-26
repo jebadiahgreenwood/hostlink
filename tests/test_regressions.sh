@@ -44,6 +44,8 @@ max_output_bytes = 67108864
 output_tmpdir = $T/out
 log_target = $T/daemon.log
 log_level = info
+job_max_spool_bytes = 65536
+job_retention_s = 60
 EOF
 
 "$DAEMON" -c "$T/hostlink.conf" -p "$T/hl.pid" -f > "$T/daemon.stderr" 2>&1 &
@@ -333,6 +335,194 @@ check_eq "each file reports its own sha256 (an implicit manifest)" "$n" "$NREG"
 echo "--- trailing slash on the source is harmless ---"
 rm -rf "$T/dstS"; hl put "$SRC/" "$T/dstS" >/dev/null 2>&1
 check_eq "put dir/ (trailing slash) same file count" "$(find "$T/dstS" -type f | wc -l)" "$NREG"
+
+####################################################################
+# v1.6.0 — jobs, per-target timeouts, verify manifest, remote df
+####################################################################
+
+echo
+echo "=== F6.1: detached jobs ==="
+
+# The id lands on STDOUT so it can be captured; the human line goes to stderr.
+JID=$(hl -D exec 'echo out-1; echo err-1 >&2; sleep 1; echo out-2; exit 7' 2>/dev/null)
+case "$JID" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+    ok "-D returns a 12-hex job id on stdout" ;;
+  *) bad "-D job id" "got [$JID]" ;;
+esac
+
+state() { hl -j job status "$1" 2>/dev/null | sed 's/.*"state":"\([a-z]*\)".*/\1/'; }
+check_eq "a job in flight reports running" "$(state "$JID")" "running"
+
+hl job wait "$JID" >/dev/null 2>&1
+check_eq "job wait exits with the job's own status" "$?" "7"
+check_eq "job wait leaves it terminal"  "$(state "$JID")" "exited"
+check_eq "tail returns the whole spool" "$(hl job tail "$JID" 2>/dev/null | tr '\n' ',')" "out-1,out-2,"
+check_eq "tail --stderr reads the other stream" "$(hl job tail "$JID" --stderr 2>/dev/null)" "err-1"
+hl job list 2>/dev/null | grep -q "$JID" && ok "job list includes it" || bad "job list" "missing $JID"
+
+# Incremental tail: a second read from next_offset must return only what is new,
+# which is what makes --follow cheap instead of re-sending the log every poll.
+off=$(hl -j job tail "$JID" 2>/dev/null | sed 's/.*"next_offset":\([0-9]*\).*/\1/')
+[ "$off" -gt 0 ] 2>/dev/null && ok "tail reports a next_offset" || bad "next_offset" "got [$off]"
+
+echo "--- a job outlives the wire timeout that would kill an exec ---"
+# With -D, -T stops meaning "how long this client waits" and starts meaning
+# "how long the job may run". The client returns at once either way; the
+# command below outlives the 2s an attached exec -T 2000 would have allowed.
+start=$(date +%s)
+JID2=$(hl -T 20000 -D exec 'sleep 3; echo lived' 2>/dev/null)
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -le 1 ] && ok "-D returns immediately, without waiting for the command" \
+                     || bad "-D return" "took ${elapsed}s"
+sleep 4
+check_eq "and the job ran to completion under its own -T bound" \
+         "$(hl job tail "$JID2" 2>/dev/null)" "lived"
+JID3=$(hl -D exec 'sleep 0.1' 2>/dev/null)
+tmo=$(hl -j job status "$JID3" 2>/dev/null | sed 's/.*"timeout_ms":\([0-9]*\).*/\1/')
+[ "$tmo" -ge 3600000 ] 2>/dev/null && ok "a plain -D job gets the daemon's job default, not 30s" \
+                                   || bad "job default timeout" "got [$tmo]"
+
+echo "--- job timeout ---"
+JID4=$(hl -T 800 -D exec 'echo before-timeout; sleep 30' 2>/dev/null)
+hl job wait "$JID4" >/dev/null 2>&1
+check_eq "an over-running job is killed and reports 124" "$?" "124"
+check_eq "its state is timeout" "$(state "$JID4")" "timeout"
+check_eq "output produced before the kill is kept" "$(hl job tail "$JID4" 2>/dev/null)" "before-timeout"
+
+echo "--- cancel reaches the process group, not just the shell ---"
+MARKER="$T/cancel-marker-$$"
+JID5=$(hl -D exec "sleep 60 & echo \$! > $MARKER; wait" 2>/dev/null)
+sleep 0.6
+CHILD=$(cat "$MARKER" 2>/dev/null)
+hl job cancel "$JID5" >/dev/null 2>&1
+check_eq "cancel is accepted" "$?" "0"
+sleep 0.6
+check_eq "the job is terminal after cancel" "$(state "$JID5")" "exited"
+if [ -n "$CHILD" ]; then
+  kill -0 "$CHILD" 2>/dev/null && bad "cancel reach" "grandchild $CHILD survived" \
+                               || ok "a grandchild of the job was killed too"
+fi
+hl job cancel "$JID5" >/dev/null 2>&1
+check_eq "cancelling a finished job fails cleanly" "$?" "1"
+
+echo "--- a job id is a path component, so it is validated ---"
+for bad_id in '../../etc/passwd' 'abc' 'ABCDEF012345' '0123456789abx' '' ; do
+  hl job status "$bad_id" >/dev/null 2>&1
+  check_eq "rejected job id [$bad_id]" "$?" "125"
+done
+hl job status 0123456789ab >/dev/null 2>&1
+check_eq "well-formed but unknown id -> not found" "$?" "1"
+hl job frobnicate 0123456789ab >/dev/null 2>&1
+check_eq "unknown job action -> 125" "$?" "125"
+hl job tail "$JID" --nonsense >/dev/null 2>&1
+check_eq "unknown job flag -> 125 (not ignored)" "$?" "125"
+
+echo "--- the spool is capped, and says so ---"
+JID6=$(hl -D exec 'seq 1 200000; exit 5' 2>/dev/null)
+hl job wait "$JID6" >/dev/null 2>&1
+check_eq "the command still finishes normally past the cap" "$?" "5"
+check_eq "the spool stops exactly at job_max_spool_bytes" \
+         "$(stat -c%s "$T/out/jobs/$JID6/stdout" 2>/dev/null)" "65536"
+# Not `hl ... | grep -q`: under pipefail the pipeline inherits hl's exit status,
+# which for a job that exited 5 is 5 — a passing grep would read as a failure.
+cap_out=$(hl job status "$JID6" 2>&1)
+case "$cap_out" in
+  *CAPPED*) ok "truncation is reported, with the produced size" ;;
+  *)        bad "cap report" "no CAPPED in: $(echo "$cap_out" | tail -1)" ;;
+esac
+
+echo "--- finished spools are collected, running ones are not ---"
+touch -d '1 hour ago' "$T/out/jobs/$JID6/status"
+JID7=$(hl -D exec 'true' 2>/dev/null)     # submission triggers the sweep
+sleep 0.3
+[ ! -d "$T/out/jobs/$JID6" ] && ok "an aged finished job is swept" || bad "gc" "$JID6 still present"
+[ -d "$T/out/jobs/$JID7" ]   && ok "the fresh job survives the sweep" || bad "gc overreach" "swept $JID7"
+
+echo
+echo "=== F6.2: per-target default timeout ==="
+cat > "$T/targets.conf" <<TEOF
+[slow]
+transport = unix
+socket = $T/hl.sock
+token = $TOKEN
+timeout_ms = 4000
+
+[quick]
+transport = unix
+socket = $T/hl.sock
+token = $TOKEN
+timeout_ms = 300
+TEOF
+# HOSTLINK_TOKEN, if the environment has one, silently overrides every
+# per-target token — the pitfall the bin/ wrappers all guard against with
+# `env -u`. A test that reads tokens from a file has to do the same.
+tgt() { local t="$1"; shift; env -u HOSTLINK_TOKEN "$CLI" --targets-file "$T/targets.conf" -t "$t" "$@"; }
+tgt slow exec 'sleep 1; echo patient' >/dev/null 2>&1
+check_eq "a target default above 1s lets a 1s command finish" "$?" "0"
+tgt quick exec 'sleep 1; echo nope' >/dev/null 2>&1
+check_eq "a short target default times out (300ms < 1s)" "$?" "124"
+tgt quick -T 4000 exec 'sleep 1; echo override' >/dev/null 2>&1
+check_eq "an explicit -T overrides the target default" "$?" "0"
+
+echo "--- the daemon's clamp is no longer silent ---"
+hl -T 999000 exec 'true' 2>&1 | grep -q 'exceeds this daemon' \
+  && ok "-T above max_timeout_ms warns and reports the effective value" \
+  || bad "clamp warning" "no warning printed"
+hl -T 1000 exec 'true' 2>&1 | grep -q 'exceeds this daemon' \
+  && bad "clamp warning" "warned when nothing was clamped" \
+  || ok "no warning when the requested timeout is honoured"
+
+echo
+echo "=== F5: verify manifest on a directory put ==="
+rm -rf "$T/vdst"
+man_out=$(hl put "$SRC" "$T/vdst" --verify 2>"$T/verify.err")
+check_eq "one sha256 line per file" "$(echo "$man_out" | grep -c '^[0-9a-f]\{64\}  ')" "$NREG"
+grep -q "$NREG of $NREG files sha256-verified" "$T/verify.err" \
+  && ok "summary counts every file" || bad "manifest summary" "$(cat "$T/verify.err" | tail -2)"
+# The digests must be the real thing, not something we made up: check the
+# manifest against the local files with sha256sum's own -c.
+(cd "$SRC" && echo "$man_out" | sha256sum -c --status -) \
+  && ok "every digest matches the local file (sha256sum -c)" \
+  || bad "manifest digests" "sha256sum -c rejected the manifest"
+check_eq "and the files actually landed" "$(find "$T/vdst" -type f | wc -l)" "$NREG"
+# Wrappers pass transfer flags BEFORE the subcommand (hl-put does), so --verify
+# has to work there too — accepting a flag in only one position is how F2
+# happened in the first place.
+rm -rf "$T/vdst2"
+n=$(hl --verify put "$SRC" "$T/vdst2" 2>/dev/null | grep -c '^[0-9a-f]\{64\}  ')
+check_eq "--verify works before the subcommand as well" "$n" "$NREG"
+
+echo
+echo "=== remote free space (stat_fs) ==="
+free=$("$CLI" -s "$T/hl.sock" -k "$TOKEN" df "$T" 2>/dev/null | sed 's/ free.*//')
+[ "$free" -gt 0 ] 2>/dev/null && ok "df reports free bytes for an existing path" || bad "df" "got [$free]"
+deep=$("$CLI" -s "$T/hl.sock" -k "$TOKEN" df "$T/does/not/exist/yet" 2>/dev/null)
+echo "$deep" | grep -q 'nearest existing ancestor' \
+  && ok "df walks up to the nearest existing ancestor (the put case)" \
+  || bad "df ancestor walk" "got [$deep]"
+free2=$(echo "$deep" | sed 's/ free.*//')
+check_eq "and reports that filesystem's free space" "$free2" "$free"
+
+# /dev/shm is 64 MiB in this container — small enough to refuse a put against,
+# without needing root to mount anything.
+if [ -d /dev/shm ] && [ "$(df -k /dev/shm | awk 'NR==2{print $2}')" -lt 1048576 ]; then
+  BIG="$T/big"; mkdir -p "$BIG"
+  truncate -s 80M "$BIG/huge.bin"        # sparse: costs no disk, real st_size
+  rm -rf /dev/shm/hltest
+  out=$(hl put "$BIG" /dev/shm/hltest 2>&1); rc=$?
+  check_eq "a put larger than the remote filesystem is refused" "$rc" "125"
+  echo "$out" | grep -q 'not enough space' && ok "and says so before transferring" \
+                                           || bad "space refusal" "got [$(echo "$out"|head -1)]"
+  [ ! -e /dev/shm/hltest ] && ok "nothing was written on the far side" \
+                           || bad "space refusal" "it started transferring anyway"
+  rm -rf /dev/shm/hltest "$BIG"
+else
+  echo "  SKIP  no small filesystem available to test the refusal path"
+fi
+rm -rf "$T/okdst"
+hl put "$SRC" "$T/okdst" >/dev/null 2>&1
+check_eq "a put that fits is not refused (no false positive)" "$?" "0"
 
 echo
 echo "=== $PASS passed, $FAIL failed ==="

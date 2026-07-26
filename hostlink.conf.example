@@ -37,6 +37,26 @@ default_max_output_bytes = 4194304
 max_output_bytes = 67108864
 output_tmpdir = /run/hostlink/output
 
+# --- Detached jobs (1.6.0) ---
+# `exec --detach` returns a job id; the daemon spools the job's output under
+# <output_tmpdir>/jobs/<id>/ so it can be tailed, waited on and cancelled.
+#
+# These are deliberately separate from the exec limits above: a job exists to
+# outlive the conversation those defaults are tuned for. Clamping a build to
+# max_timeout_ms would defeat the feature.
+#
+# job_default_timeout_ms: used when the caller passes no -T (24 h).
+# job_max_timeout_ms:     hard ceiling even with -T (7 d).
+# job_max_spool_bytes:    per stream, per job. NOTE this is a ceiling on disk
+#   usage in output_tmpdir; if that is a tmpfs (as /run is), it is a ceiling on
+#   RAM. Output past the cap is discarded, but the command still runs to
+#   completion and the truncation is reported.
+# job_retention_s:        finished spools are swept this long after they end.
+job_default_timeout_ms = 86400000
+job_max_timeout_ms = 604800000
+job_max_spool_bytes = 268435456
+job_retention_s = 86400
+
 # --- Logging ---
 # Options: "syslog", "stderr", or a file path
 log_target = syslog

@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "executor.h"
+#include "jobs.h"
 #include "../common/log.h"
 
 static long long now_ms(void) {
@@ -142,6 +143,68 @@ static void free_env(char **env, int heap_count) {
     free(env);
 }
 
+/*
+ * ── Job supervisor ───────────────────────────────────────────────────────
+ *
+ * Runs as the middle process of the detach fork chain when a job id is set:
+ *
+ *   daemon ──fork──▶ A ──fork──▶ B (supervisor) ──fork──▶ C (the shell)
+ *                    │            │                       │
+ *          A writes  │            │ B runs the ordinary   │ C is exactly the
+ *          the meta  │            │ synchronous executor  │ child any other
+ *          file and  ▼            │ against the job's     │ exec would get:
+ *          exits    exit          │ spool files, then     │ own process group,
+ *                                 │ writes `status`       │ clean signal state
+ *
+ * Three forks rather than two because each level earns its keep: A exists so
+ * the daemon never waits on a long job (it reaps A immediately), and A is also
+ * the only process that knows B's pid, which is what the registry needs to
+ * answer "is it still running". B exists so that *something* observes C's exit
+ * and records it — a grandchild reparented to init, as plain --detach does,
+ * dies unwitnessed.
+ *
+ * B reuses executor_run rather than reimplementing the wait. That is the whole
+ * reason this is short: the pipe draining, the output cap, the timeout, the
+ * process-group kill and the signal hygiene are already correct there, and a
+ * second copy of them would be a second place for them to rot.
+ */
+static void job_supervisor(exec_result_t *r) {
+    /* B is a fork of the daemon's main process, so it inherits the listening
+     * sockets, the epoll fd, the signalfd and the pidfile fd. Left open, they
+     * keep a restarting daemon from rebinding its TCP port. Nothing above fd 2
+     * is ours. */
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+    int null_rd = open("/dev/null", O_RDONLY);
+    int null_wr = open("/dev/null", O_WRONLY);
+    if (null_rd >= 0) { dup2(null_rd, STDIN_FILENO);  if (null_rd > 2) close(null_rd); }
+    if (null_wr >= 0) {
+        dup2(null_wr, STDOUT_FILENO);
+        dup2(null_wr, STDERR_FILENO);
+        if (null_wr > 2) close(null_wr);
+    }
+    /* The log fd went out with the rest. Point logging at stderr, which is now
+     * /dev/null, so a stray log call cannot write into a spool file that has
+     * since been handed the same descriptor number. */
+    log_init(LOG_TARGET_STDERR, HL_LOG_ERROR, NULL);
+
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+
+    /* Run it as an ordinary synchronous exec, spooling to the job directory. */
+    r->detach         = 0;
+    r->output_to_file = 1;
+    snprintf(r->pid_path, sizeof(r->pid_path), "%s/pid", r->job_dir);
+    executor_run(r);
+    unlink(r->pid_path);   /* a stale pid file would make `cancel` signal a stranger */
+
+    const char *state = r->exec_error ? "error" : (r->timed_out ? "timeout" : "exited");
+    jobs_write_status(r->job_dir, state, r->exit_code, r->duration_ms,
+                      r->stdout_original_bytes, r->stderr_original_bytes,
+                      r->stdout_truncated, r->stderr_truncated, r->error_msg);
+    _exit(0);
+}
+
 /* ── Detach path: double-fork so grandchild is owned by init ─────────── */
 static void executor_run_detach(exec_result_t *r) {
     long long start_ms = now_ms();
@@ -154,15 +217,22 @@ static void executor_run_detach(exec_result_t *r) {
         return;
     }
 
+    /* Plain detach execs the shell directly from the grandchild, so it needs
+     * the environment built here. A job does not: its supervisor calls
+     * executor_run, which builds its own — building it twice would only leak
+     * the first copy into a process that lives as long as the job. */
     int env_heap = 0;
-    char **env = build_env(r, &env_heap);
-    if (!env) {
-        /* Without the environment the stub has no command to eval — fail loud
-         * rather than silently running nothing. */
-        snprintf(r->error_msg, sizeof(r->error_msg), "out of memory building environment");
-        r->exec_error = 1;
-        r->duration_ms = 0;
-        return;
+    char **env = NULL;
+    if (!r->job_id[0]) {
+        env = build_env(r, &env_heap);
+        if (!env) {
+            /* Without the environment the stub has no command to eval — fail
+             * loud rather than silently running nothing. */
+            snprintf(r->error_msg, sizeof(r->error_msg), "out of memory building environment");
+            r->exec_error = 1;
+            r->duration_ms = 0;
+            return;
+        }
     }
 
     /* First fork */
@@ -182,7 +252,17 @@ static void executor_run_detach(exec_result_t *r) {
 
         pid_t gpid = fork();
         if (gpid < 0) _exit(1);
-        if (gpid > 0) _exit(0); /* intermediate exits immediately */
+        if (gpid > 0) {
+            /* In job mode this is the only process that ever knows the
+             * supervisor's pid, so the registry entry is written here, before
+             * exiting. A client that queries in the microseconds before this
+             * lands sees state=starting, which is why that state exists. */
+            if (r->job_id[0])
+                jobs_write_meta(r->job_dir, (long)gpid, r->workdir, r->timeout_ms);
+            _exit(0);
+        }
+
+        if (r->job_id[0]) job_supervisor(r);   /* does not return */
 
         /* Grandchild: fully detached */
         int null_rd = open("/dev/null", O_RDONLY);
@@ -256,10 +336,17 @@ void executor_run(exec_result_t *r) {
                 return;
             }
         }
-        snprintf(r->stdout_file, sizeof(r->stdout_file),
-                 "%s/hl_%s_stdout", r->output_tmpdir, r->request_id);
-        snprintf(r->stderr_file, sizeof(r->stderr_file),
-                 "%s/hl_%s_stderr", r->output_tmpdir, r->request_id);
+        if (r->out_path[0] && r->err_path[0]) {
+            /* Job mode: the spool lives in the job's own directory, named by
+             * the registry rather than derived from the request id. */
+            snprintf(r->stdout_file, sizeof(r->stdout_file), "%s", r->out_path);
+            snprintf(r->stderr_file, sizeof(r->stderr_file), "%s", r->err_path);
+        } else {
+            snprintf(r->stdout_file, sizeof(r->stdout_file),
+                     "%s/hl_%s_stdout", r->output_tmpdir, r->request_id);
+            snprintf(r->stderr_file, sizeof(r->stderr_file),
+                     "%s/hl_%s_stderr", r->output_tmpdir, r->request_id);
+        }
         out_fd = open(r->stdout_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         err_fd = open(r->stderr_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (out_fd < 0 || err_fd < 0) {
@@ -335,6 +422,16 @@ void executor_run(exec_result_t *r) {
     }
 
     /* Parent */
+    /* Publish the child's pid so a job can be cancelled later. It is its own
+     * process group leader (setpgrp above), so the recorded pid doubles as the
+     * pgid to signal — killing the group, not just the shell, which is what
+     * makes `job cancel` reach a build's actual compiler processes. */
+    if (r->pid_path[0]) {
+        char pbuf[32];
+        int pn = snprintf(pbuf, sizeof(pbuf), "%d\n", (int)pid);
+        int pfd = open(r->pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (pfd >= 0) { ssize_t w = write(pfd, pbuf, (size_t)pn); (void)w; close(pfd); }
+    }
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
     if (out_fd >= 0) close(out_fd);
@@ -402,7 +499,25 @@ void executor_run(exec_result_t *r) {
 
                 if (r->output_to_file) {
                     int wfd = is_stdout ? out_write_fd : err_write_fd;
-                    if (wfd >= 0) { ssize_t wn = write(wfd, rbuf, (size_t)nr); (void)wn; }
+                    /* file_cap_bytes bounds an unattended job's spool. We keep
+                     * counting original_bytes past the cap and keep draining
+                     * the pipe — stopping the read would block the command on
+                     * a full pipe, turning a big log into a hang. */
+                    long long written = *orig - nr;   /* *orig already counts this chunk */
+                    int over = r->file_cap_bytes > 0 && written >= r->file_cap_bytes;
+                    if (over) {
+                        if (is_stdout) r->stdout_truncated = 1;
+                        else           r->stderr_truncated = 1;
+                    } else if (wfd >= 0) {
+                        size_t to_write = (size_t)nr;
+                        if (r->file_cap_bytes > 0 &&
+                            written + (long long)to_write > r->file_cap_bytes) {
+                            to_write = (size_t)(r->file_cap_bytes - written);
+                            if (is_stdout) r->stdout_truncated = 1;
+                            else           r->stderr_truncated = 1;
+                        }
+                        ssize_t wn = write(wfd, rbuf, to_write); (void)wn;
+                    }
                 } else {
                     long long limit  = is_stdout ? r->max_stdout_bytes : r->max_stderr_bytes;
                     char    **buf    = is_stdout ? &r->stdout_buf : &r->stderr_buf;

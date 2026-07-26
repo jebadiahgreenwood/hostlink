@@ -20,6 +20,20 @@ typedef struct {
     char   shell[256];
     int    detach;   /* 1 = double-fork, return immediately, no output captured */
 
+    /* Job mode. When job_id is set, detach spools into an explicit directory
+     * instead of discarding output, and a supervisor records the exit status.
+     * out_path/err_path override the tmpdir-derived spool names; file_cap_bytes
+     * bounds each stream in file mode (0 = unbounded, which is what plain -O
+     * has always been and stays). */
+    char   job_id[16];
+    char   job_dir[512];
+    /* Sized above job_dir + the longest suffix we append, so composing them
+     * cannot truncate — a truncated path names a different file. */
+    char   out_path[576];
+    char   err_path[576];
+    char   pid_path[576];   /* if set, the child's pid is written here on fork */
+    long long file_cap_bytes;
+
     /* outputs */
     char  *stdout_buf;
     size_t stdout_len;
@@ -29,8 +43,8 @@ typedef struct {
     long long stderr_original_bytes;
     int    stdout_truncated;
     int    stderr_truncated;
-    char   stdout_file[512];
-    char   stderr_file[512];
+    char   stdout_file[576];
+    char   stderr_file[576];
     int    exit_code;
     int    timed_out;
     long   duration_ms;

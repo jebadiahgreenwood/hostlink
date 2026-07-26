@@ -15,8 +15,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <ftw.h>
+#include <sys/statvfs.h>
 #include "server.h"
 #include "executor.h"
+#include "jobs.h"
 #include "../common/protocol.h"
 #include "../common/config.h"
 #include "../common/log.h"
@@ -390,6 +392,76 @@ static int get_stat_walk_cb(const char *fpath, const struct stat *sb,
     g_walk_count++;
     g_walk_total += (uint64_t)sb->st_size;
     return 0;
+}
+
+/* ── stat_fs ──────────────────────────────────────────────────────────────
+ *
+ * Free space on the filesystem that would hold `path`.
+ *
+ * `get` has always checked free space before pulling — a local statvfs, which
+ * costs nothing. `put` could not: the space that matters is on the far side,
+ * and the daemon exposed no way to ask. So a directory put that did not fit
+ * simply failed partway, on whichever file happened to exhaust the disk, after
+ * however many gigabytes had already crossed the link. That asymmetry is worth
+ * closing on its own, and it is worth closing HERE, given the host's root
+ * filesystem currently sits at 100% with 7 GB free.
+ *
+ * The interesting case is a destination that does not exist yet, which is the
+ * normal case for a put — so we walk up to the nearest existing ancestor and
+ * stat that. Its filesystem is the one the new directory will land on, unless
+ * a mount point appears in between, which cannot happen for a path that does
+ * not exist.
+ *
+ * Wire protocol:
+ *   C→D {type:"stat_fs", id, token, path}
+ *   D→C {status:"ok", path, resolved, free_bytes, total_bytes, block_size}
+ */
+static void handle_stat_fs(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    j = cJSON_GetObjectItem(req, "path");
+    if (!cJSON_IsString(j) || j->valuestring[0] == '\0') {
+        send_error(fd, req_id, "bad_request", "path is required");
+        return;
+    }
+
+    char probe[4096];
+    if (snprintf(probe, sizeof(probe), "%s", j->valuestring) >= (int)sizeof(probe)) {
+        send_error(fd, req_id, "bad_request", "path too long");
+        return;
+    }
+
+    struct statvfs vfs;
+    while (statvfs(probe, &vfs) != 0) {
+        char *slash = strrchr(probe, '/');
+        if (!slash) { snprintf(probe, sizeof(probe), "."); break; }
+        if (slash == probe) { probe[1] = '\0'; break; }   /* down to "/" */
+        *slash = '\0';
+    }
+    if (statvfs(probe, &vfs) != 0) {
+        send_error(fd, req_id, "error", strerror(errno));
+        return;
+    }
+
+    /* f_bavail, not f_bfree: the reserved blocks are not ours to fill. */
+    unsigned long long bs   = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+    unsigned long long free_b  = (unsigned long long)vfs.f_bavail * bs;
+    unsigned long long total_b = (unsigned long long)vfs.f_blocks * bs;
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version", 1);
+    cJSON_AddStringToObject(resp, "id",     req_id);
+    cJSON_AddStringToObject(resp, "node",   g_cfg->node_name);
+    cJSON_AddStringToObject(resp, "status", "ok");
+    cJSON_AddStringToObject(resp, "path",     j->valuestring);
+    cJSON_AddStringToObject(resp, "resolved", probe);
+    cJSON_AddNumberToObject(resp, "free_bytes",  (double)free_b);
+    cJSON_AddNumberToObject(resp, "total_bytes", (double)total_b);
+    cJSON_AddNumberToObject(resp, "block_size",  (double)bs);
+    frame_send_json(fd, resp);
+    cJSON_Delete(resp);
 }
 
 static void handle_get_stat(int fd, cJSON *req) {
@@ -776,11 +848,53 @@ static void handle_exec(int fd, cJSON *req) {
     j = cJSON_GetObjectItem(req, "timeout_ms");
     r.timeout_ms = (cJSON_IsNumber(j) && j->valueint > 0)
                    ? j->valueint : g_cfg->default_timeout_ms;
+    /* Clamping was silent: ask for -T 900000 against a daemon capped at
+     * 300000 and the command died at five minutes reporting a plain timeout,
+     * with nothing anywhere saying the request had been overruled. Same
+     * fail-silent class as F1/F2 — record it and let the client say so. */
+    int requested_timeout_ms = r.timeout_ms;
     if (r.timeout_ms > g_cfg->max_timeout_ms) r.timeout_ms = g_cfg->max_timeout_ms;
 
     /* detach flag */
     j = cJSON_GetObjectItem(req, "detach");
     r.detach = cJSON_IsTrue(j) ? 1 : 0;
+
+    /*
+     * Every detached command becomes a job.
+     *
+     * Before this, --detach threw the output at /dev/null and returned
+     * nothing you could hold on to: you could start a build over the link but
+     * not learn whether it finished, let alone what it said. The wrappers
+     * worked around it by redirecting to a file inside the command and polling
+     * — the very friction F6 was filed about.
+     *
+     * A pre-1.6 client that sends detach:true simply gets a job_id field it
+     * ignores, and its output spooled instead of discarded. Nothing it relied
+     * on changes.
+     */
+    if (r.detach) {
+        char job_id[HL_JOB_ID_LEN + 1], job_dir[HL_JOB_DIR_MAX];
+        if (jobs_create(g_cfg, r.command, job_id, job_dir, sizeof(job_dir)) != 0) {
+            send_error(fd, req_id, "error",
+                       "cannot create job spool (check output_tmpdir)");
+            return;
+        }
+        snprintf(r.job_id,  sizeof(r.job_id),  "%s", job_id);
+        snprintf(r.job_dir, sizeof(r.job_dir), "%s", job_dir);
+        snprintf(r.out_path, sizeof(r.out_path), "%s/stdout", job_dir);
+        snprintf(r.err_path, sizeof(r.err_path), "%s/stderr", job_dir);
+        r.file_cap_bytes = g_cfg->job_max_spool_bytes;
+
+        /* A job's patience is its own. The exec defaults exist to bound how
+         * long a CLIENT waits on the wire; a job has no client waiting, and
+         * clamping a clean build to max_timeout_ms (5 min by default) would
+         * defeat the whole feature. Only an explicit -T narrows it. */
+        j = cJSON_GetObjectItem(req, "job_timeout_ms");
+        r.timeout_ms = (cJSON_IsNumber(j) && j->valueint > 0)
+                       ? j->valueint : g_cfg->job_default_timeout_ms;
+        if (g_cfg->job_max_timeout_ms > 0 && r.timeout_ms > g_cfg->job_max_timeout_ms)
+            r.timeout_ms = g_cfg->job_max_timeout_ms;
+    }
 
     long long eff_max = g_cfg->default_max_output_bytes;
     j = cJSON_GetObjectItem(req, "max_stdout_bytes");
@@ -834,6 +948,7 @@ static void handle_exec(int fd, cJSON *req) {
 
     if (r.detach) {
         cJSON_AddTrueToObject(resp, "detached");
+        if (r.job_id[0]) cJSON_AddStringToObject(resp, "job_id", r.job_id);
     } else if (r.output_to_file) {
         cJSON_AddStringToObject(resp, "stdout_file", r.stdout_file);
         cJSON_AddStringToObject(resp, "stderr_file", r.stderr_file);
@@ -846,10 +961,224 @@ static void handle_exec(int fd, cJSON *req) {
     cJSON_AddNumberToObject(resp, "stdout_original_bytes", (double)r.stdout_original_bytes);
     cJSON_AddNumberToObject(resp, "stderr_original_bytes", (double)r.stderr_original_bytes);
     cJSON_AddNumberToObject(resp, "duration_ms",           (double)r.duration_ms);
+    if (!r.detach && requested_timeout_ms > r.timeout_ms) {
+        cJSON_AddNumberToObject(resp, "timeout_requested_ms", requested_timeout_ms);
+        cJSON_AddNumberToObject(resp, "timeout_effective_ms", r.timeout_ms);
+    }
 
     frame_send_json(fd, resp);
     cJSON_Delete(resp);
     executor_free(&r);
+}
+
+/* ── job ──────────────────────────────────────────────────────────────────
+ *
+ * Wire protocol:
+ *   C→D {type:"job", action:"status"|"tail"|"list"|"cancel", id, token,
+ *        job_id, [stream:"stdout"|"stderr"], [offset], [max_bytes]}
+ *   D→C {status:"ok", ..., per action}
+ *
+ * There is deliberately no "wait" action. A server-side wait would hold a
+ * forked worker for the entire life of the job, and with max_concurrent_io
+ * defaulting to 4, four waiters would lock every transfer out of the daemon.
+ * The client implements wait by polling status, which costs one cheap round
+ * trip per interval, cannot exhaust anything, and keeps working across a
+ * daemon restart.
+ *
+ * Runs in a forked I/O worker: reads are small but they are still filesystem
+ * work, and the event loop stays free.
+ */
+#define HL_JOB_TAIL_DEFAULT  (64u * 1024u)
+#define HL_JOB_TAIL_MAX      (4u * 1024u * 1024u)
+#define HL_JOB_LIST_MAX      256
+
+static void job_add_info(cJSON *o, const job_info_t *ji) {
+    cJSON_AddStringToObject(o, "job_id",  ji->id);
+    cJSON_AddStringToObject(o, "state",   job_state_name(ji->state));
+    cJSON_AddBoolToObject  (o, "done",    job_state_is_terminal(ji->state));
+    cJSON_AddStringToObject(o, "command", ji->command);
+    cJSON_AddNumberToObject(o, "created_at",   (double)ji->created_at);
+    cJSON_AddNumberToObject(o, "ended_at",     (double)ji->ended_at);
+    cJSON_AddNumberToObject(o, "exit_code",    ji->exit_code);
+    cJSON_AddNumberToObject(o, "duration_ms",  (double)ji->duration_ms);
+    cJSON_AddNumberToObject(o, "stdout_bytes", (double)ji->stdout_bytes);
+    cJSON_AddNumberToObject(o, "stderr_bytes", (double)ji->stderr_bytes);
+    cJSON_AddNumberToObject(o, "stdout_original_bytes", (double)ji->stdout_original);
+    cJSON_AddNumberToObject(o, "stderr_original_bytes", (double)ji->stderr_original);
+    cJSON_AddBoolToObject  (o, "stdout_truncated", ji->stdout_truncated);
+    cJSON_AddBoolToObject  (o, "stderr_truncated", ji->stderr_truncated);
+    cJSON_AddNumberToObject(o, "timeout_ms",   ji->timeout_ms);
+    cJSON_AddNumberToObject(o, "pid",          (double)ji->supervisor_pid);
+    if (ji->workdir[0])   cJSON_AddStringToObject(o, "workdir",   ji->workdir);
+    if (ji->error_msg[0]) cJSON_AddStringToObject(o, "error_msg", ji->error_msg);
+}
+
+static void handle_job(int fd, cJSON *req) {
+    const char *req_id = "";
+    cJSON *j = cJSON_GetObjectItem(req, "id");
+    if (cJSON_IsString(j)) req_id = j->valuestring;
+
+    const char *action = "";
+    j = cJSON_GetObjectItem(req, "action");
+    if (cJSON_IsString(j)) action = j->valuestring;
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "version", 1);
+    cJSON_AddStringToObject(resp, "id",   req_id);
+    cJSON_AddStringToObject(resp, "node", g_cfg->node_name);
+
+    if (!strcmp(action, "list")) {
+        job_info_t *all = calloc(HL_JOB_LIST_MAX, sizeof(*all));
+        if (!all) {
+            cJSON_Delete(resp);
+            send_error(fd, req_id, "error", "out of memory");
+            return;
+        }
+        int n = jobs_list(g_cfg, all, HL_JOB_LIST_MAX);
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < n; i++) {
+            cJSON *o = cJSON_CreateObject();
+            job_add_info(o, &all[i]);
+            cJSON_AddItemToArray(arr, o);
+        }
+        free(all);
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddItemToObject(resp, "jobs", arr);
+        frame_send_json(fd, resp);
+        cJSON_Delete(resp);
+        return;
+    }
+
+    const char *job_id = "";
+    j = cJSON_GetObjectItem(req, "job_id");
+    if (cJSON_IsString(j)) job_id = j->valuestring;
+
+    /* A job id is a path component. Anything that is not exactly twelve hex
+     * characters is refused before it can be interpolated into a path. */
+    if (!jobs_id_valid(job_id)) {
+        cJSON_Delete(resp);
+        send_error(fd, req_id, "bad_request",
+                   "invalid job id (expected 12 hex characters)");
+        return;
+    }
+
+    job_info_t ji;
+    if (jobs_read(g_cfg, job_id, &ji) != 0) {
+        cJSON_Delete(resp);
+        send_error(fd, req_id, "not_found", "no such job");
+        return;
+    }
+
+    if (!strcmp(action, "status")) {
+        cJSON_AddStringToObject(resp, "status", "ok");
+        job_add_info(resp, &ji);
+        frame_send_json(fd, resp);
+        cJSON_Delete(resp);
+        return;
+    }
+
+    if (!strcmp(action, "cancel")) {
+        /* Signal the process GROUP, which is why executor_run records the
+         * child's pid: the shell alone is rarely what is busy. Without this,
+         * the only way to stop a runaway job over the link would be `pkill
+         * -f`, which is exactly the footgun F8 exists to keep people away
+         * from. */
+        char pidpath[HL_JOB_DIR_MAX + 8], dir[HL_JOB_DIR_MAX];
+        long child = 0;
+        if (jobs_dir_for(g_cfg, job_id, dir, sizeof(dir)) == 0 &&
+            snprintf(pidpath, sizeof(pidpath), "%s/pid", dir) < (int)sizeof(pidpath)) {
+            FILE *pf = fopen(pidpath, "r");
+            if (pf) { if (fscanf(pf, "%ld", &child) != 1) child = 0; fclose(pf); }
+        }
+        int signalled = 0;
+        if (job_state_is_terminal(ji.state)) {
+            cJSON_AddStringToObject(resp, "error_msg", "job already finished");
+        } else if (child > 0) {
+            const char *sigstr = "TERM";
+            cJSON *sj = cJSON_GetObjectItem(req, "signal");
+            if (cJSON_IsString(sj)) sigstr = sj->valuestring;
+            int sig = !strcmp(sigstr, "KILL") ? SIGKILL : SIGTERM;
+            signalled = (kill((pid_t)(-child), sig) == 0);
+            if (!signalled)
+                cJSON_AddStringToObject(resp, "error_msg", strerror(errno));
+        } else {
+            cJSON_AddStringToObject(resp, "error_msg",
+                                    "no running process recorded for this job");
+        }
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddBoolToObject(resp, "signalled", signalled);
+        job_add_info(resp, &ji);
+        frame_send_json(fd, resp);
+        cJSON_Delete(resp);
+        return;
+    }
+
+    if (!strcmp(action, "tail")) {
+        const char *stream = "stdout";
+        j = cJSON_GetObjectItem(req, "stream");
+        if (cJSON_IsString(j)) stream = j->valuestring;
+        if (strcmp(stream, "stdout") && strcmp(stream, "stderr")) {
+            cJSON_Delete(resp);
+            send_error(fd, req_id, "bad_request", "stream must be stdout or stderr");
+            return;
+        }
+        long long offset = 0;
+        j = cJSON_GetObjectItem(req, "offset");
+        if (cJSON_IsNumber(j) && j->valuedouble > 0) offset = (long long)j->valuedouble;
+
+        long long want = HL_JOB_TAIL_DEFAULT;
+        j = cJSON_GetObjectItem(req, "max_bytes");
+        if (cJSON_IsNumber(j) && j->valuedouble > 0) want = (long long)j->valuedouble;
+        if (want > HL_JOB_TAIL_MAX) want = HL_JOB_TAIL_MAX;
+
+        char dir[HL_JOB_DIR_MAX], path[HL_JOB_DIR_MAX + 16];
+        if (jobs_dir_for(g_cfg, job_id, dir, sizeof(dir)) != 0 ||
+            snprintf(path, sizeof(path), "%s/%s", dir, stream) >= (int)sizeof(path)) {
+            cJSON_Delete(resp);
+            send_error(fd, req_id, "error", "cannot compose spool path");
+            return;
+        }
+
+        char *buf = malloc((size_t)want + 1);
+        if (!buf) {
+            cJSON_Delete(resp);
+            send_error(fd, req_id, "error", "out of memory");
+            return;
+        }
+        long long next = offset;
+        ssize_t got = 0;
+        int sfd = open(path, O_RDONLY);
+        if (sfd >= 0) {
+            if (lseek(sfd, (off_t)offset, SEEK_SET) >= 0) {
+                got = read(sfd, buf, (size_t)want);
+                if (got < 0) got = 0;
+                next = offset + got;
+            }
+            close(sfd);
+        }
+        buf[got] = '\0';
+
+        /* The payload is a JSON string, so an embedded NUL would silently cut
+         * it short — the same limit the inline exec path has always had. Say
+         * so in the response rather than handing back a quietly short read. */
+        int binary = (memchr(buf, '\0', (size_t)got) != NULL);
+
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddStringToObject(resp, "stream", stream);
+        cJSON_AddStringToObject(resp, "data",   buf);
+        cJSON_AddNumberToObject(resp, "offset", (double)offset);
+        cJSON_AddNumberToObject(resp, "next_offset", (double)next);
+        cJSON_AddBoolToObject  (resp, "binary", binary);
+        job_add_info(resp, &ji);
+        free(buf);
+        frame_send_json(fd, resp);
+        cJSON_Delete(resp);
+        return;
+    }
+
+    cJSON_Delete(resp);
+    send_error(fd, req_id, "bad_request",
+               "job action must be status, tail, list or cancel");
 }
 
 static void dispatch_connection(int client_fd) {
@@ -900,7 +1229,8 @@ static void dispatch_connection(int client_fd) {
      * froze the whole daemon. Forking matches the exec model. */
     if (!strcmp(type, "put")        || !strcmp(type, "get") ||
         !strcmp(type, "put_stream") || !strcmp(type, "get_stream") ||
-        !strcmp(type, "get_stat")) {
+        !strcmp(type, "get_stat")   || !strcmp(type, "stat_fs") ||
+        !strcmp(type, "job")) {
         cJSON *id_j = cJSON_GetObjectItem(req, "id");
         const char *req_id = cJSON_IsString(id_j) ? id_j->valuestring : "";
 
@@ -930,6 +1260,8 @@ static void dispatch_connection(int client_fd) {
             else if (!strcmp(type, "get"))        handle_get       (client_fd, req);
             else if (!strcmp(type, "put_stream")) handle_put_stream(client_fd, req);
             else if (!strcmp(type, "get_stream")) handle_get_stream(client_fd, req);
+            else if (!strcmp(type, "stat_fs"))    handle_stat_fs   (client_fd, req);
+            else if (!strcmp(type, "job"))        handle_job       (client_fd, req);
             else                                  handle_get_stat  (client_fd, req);
             _exit(0);
         }

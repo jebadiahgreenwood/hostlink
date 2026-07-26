@@ -8,6 +8,7 @@ A lightweight daemon written in C that allows authorized clients to execute shel
 - **Simple wire protocol:** Length-prefixed frames with JSON payloads
 - **Pre-shared token auth** with constant-time comparison
 - **Output capture:** Inline (with configurable size limits) or file-based for large outputs
+- **Detached jobs:** `--detach` returns a job id; tail, wait on, or cancel it later
 - **Concurrency control:** Configurable max concurrent executions
 - **Graceful shutdown** and hot config reload via signals
 - **systemd integration** with `Restart=always`
@@ -69,12 +70,78 @@ hostlink-cli -t desktop put --mkdir ./f /srv/new/dir/f
 hostlink-cli -t desktop put ./models /srv/models
 hostlink-cli -t desktop put ./models /srv/models --exclude .cache --exclude '*.tmp'
 
+# Verify a directory put: every file streamed and sha256-checked by the remote,
+# with a sha256sum-format manifest on stdout and a pass/fail count at the end
+hostlink-cli -t desktop put ./models /srv/models --verify > manifest.txt
+
+# Free space on the far side (the check `put` runs for you before a directory
+# transfer). Walks up to the nearest existing ancestor, so it works on a
+# destination that does not exist yet.
+hostlink-cli -t desktop df /srv/models/new
+
 # Ping
 hostlink-cli -t desktop ping
 
 # List targets
 hostlink-cli targets
 ```
+
+## Detached jobs
+
+`--detach` used to be a one-way door: the command went off into the background
+and nothing came back — no id, no output, no exit status. The workaround was to
+redirect to a file inside the command and poll it by hand.
+
+Since 1.6.0 it returns a job id, and the daemon spools the job:
+
+```bash
+id=$(hostlink-cli -t build-lab -D exec "cargo build --release")
+
+hostlink-cli -t build-lab job tail   "$id" -f     # stream the log as it grows
+hostlink-cli -t build-lab job status "$id"        # state, exit code, sizes
+hostlink-cli -t build-lab job wait   "$id"        # block; exits with ITS status
+hostlink-cli -t build-lab job cancel "$id"        # signal the process group
+hostlink-cli -t build-lab job list                # what has run lately
+```
+
+The id goes to stdout so it can be captured; the human-readable line goes to
+stderr. `job wait` exits with the job's own status, so `job wait "$id" && deploy`
+reads the way it should.
+
+**What to know about it:**
+
+- A job **survives a daemon restart** — the registry is the spool directory on
+  disk, not a table in the daemon's memory. It does *not* survive
+  `systemctl restart` of the unit, because setsid does not leave the cgroup and
+  systemd tears the whole group down. A job killed that way reports `lost`
+  rather than pretending to still be running: the exit code is unknowable.
+- **Output is capped** at `job_max_spool_bytes` per stream. Past the cap the
+  daemon keeps draining the pipe (so the command never blocks) but stops
+  writing, and reports how much was produced.
+- **Finished spools are swept** after `job_retention_s`.
+- `wait` and `-f` poll from the client rather than blocking the daemon: a
+  server-side wait would hold a forked worker for the whole life of the job,
+  and a handful of waiters would shut every transfer out of the daemon.
+- `--detach` against a pre-1.6.0 daemon still works and simply returns no id.
+
+## Per-target defaults
+
+The right timeout is usually a property of the target, not of the caller: a
+build container compiles for minutes where a host answers in milliseconds. Set
+it once, in `targets.conf`:
+
+```ini
+[build-lab]
+transport = unix
+socket = /run/hostlink/hostlink-lab.sock
+token = ...
+timeout_ms = 600000
+```
+
+An explicit `-T` still wins. And if a `-T` exceeds the daemon's own
+`max_timeout_ms`, the client now says so — it used to be clamped in silence,
+which meant a command could die at five minutes when you had asked for ten with
+nothing anywhere admitting the request had been overruled.
 
 ## Client Exit Codes
 

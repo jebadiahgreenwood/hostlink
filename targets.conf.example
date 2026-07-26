@@ -13,6 +13,16 @@ address = 10.0.0.2
 port = 9876
 token = REPLACE_WITH_TOKEN
 
+[build-lab]
+transport = unix
+socket = /run/hostlink/hostlink-lab.sock
+token = REPLACE_WITH_TOKEN
+# Default command timeout for THIS target, in ms (1.6.0). The right patience is
+# a property of the target: a build container compiles for minutes where a host
+# answers in milliseconds. Without this, every wrapper script had to inject its
+# own -T. An explicit -T on the command line still wins.
+timeout_ms = 600000
+
 [dgx-spark-02]
 transport = tcp
 address = 10.0.0.3

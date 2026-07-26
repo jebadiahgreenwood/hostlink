@@ -25,7 +25,8 @@ COMMON_SRCS := \
 DAEMON_SRCS := \
 	$(SRCDIR)/daemon/main.c \
 	$(SRCDIR)/daemon/server.c \
-	$(SRCDIR)/daemon/executor.c
+	$(SRCDIR)/daemon/executor.c \
+	$(SRCDIR)/daemon/jobs.c
 
 # Client sources
 CLIENT_SRCS := \

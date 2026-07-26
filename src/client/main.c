@@ -12,6 +12,7 @@
 #include <ftw.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include "connection.h"
 #include "../common/protocol.h"
 #include "../common/config.h"
@@ -20,7 +21,7 @@
 #include "../common/sha256.h"
 #include "../common/cjson/cJSON.h"
 
-#define VERSION "1.5.1"
+#define VERSION "1.6.0"
 
 /*
  * Exit codes — ssh's model, for the same reason ssh uses it.
@@ -73,10 +74,17 @@ typedef struct {
     long long max_stderr;
     int   output_to_file;
     int   detach;           /* --detach: fire-and-forget exec */
+    /* Whether -T came from the command line, as opposed to a target default or
+     * the built-in one. It matters for -D: an explicit -T is the user saying
+     * how long the JOB may run, while an inherited default is only about how
+     * long a client is prepared to sit on the wire — and must not become a
+     * ceiling on a detached build. */
+    int   timeout_explicit;
     char  put_mode[4];      /* "644" etc — unused, kept for mode parsing */
     int   put_mkdir;        /* --mkdir: create parent dirs on put */
     int   put_mode_val;     /* octal file mode for put */
     int   stream;           /* --stream: force streaming mode for get/put */
+    int   verify;           /* --verify: sha256 manifest for a directory put */
     char  excludes[HL_MAX_EXCLUDES][256];  /* --exclude globs, directory put */
     int   exclude_count;
 } cli_opts_t;
@@ -116,6 +124,11 @@ static int resolve_target(cli_opts_t *opts, target_entry_t **out_targets) {
     }
     if (opts->token[0] == '\0')
         snprintf(opts->token, sizeof(opts->token), "%s", t->token);
+    /* Per-target default timeout (F6.2). The right patience belongs to the
+     * target: build-lab compiles for minutes, the host answers in
+     * milliseconds. An explicit -T always wins. */
+    if (!opts->timeout_explicit && t->timeout_ms > 0)
+        opts->timeout_ms = t->timeout_ms;
     return 0;
 }
 
@@ -214,8 +227,14 @@ static int cmd_exec(cli_opts_t *opts, const char *command) {
     cJSON_AddStringToObject(req, "token",      opts->token);
     cJSON_AddStringToObject(req, "command",    command);
     cJSON_AddNumberToObject(req, "timeout_ms", (double)opts->timeout_ms);
-    if (opts->detach)
+    if (opts->detach) {
         cJSON_AddTrueToObject(req, "detach");
+        /* Only a -T typed on this command line bounds the job. Otherwise the
+         * daemon's job default applies, which is measured in hours — a build
+         * must not inherit the 30 s the wire conversation is tuned for. */
+        if (opts->timeout_explicit)
+            cJSON_AddNumberToObject(req, "job_timeout_ms", (double)opts->timeout_ms);
+    }
     if (opts->max_stdout > 0)
         cJSON_AddNumberToObject(req, "max_stdout_bytes", (double)opts->max_stdout);
     if (opts->max_stderr > 0)
@@ -278,6 +297,18 @@ static int cmd_exec(cli_opts_t *opts, const char *command) {
     j = cJSON_GetObjectItem(resp, "stderr_file"); if (cJSON_IsString(j)) stderr_file = j->valuestring;
     j = cJSON_GetObjectItem(resp, "error_msg");   if (cJSON_IsString(j)) error_msg   = j->valuestring;
 
+    /* The daemon caps -T at its own max_timeout_ms, and used to do it in
+     * silence: ask for ten minutes against a daemon capped at five and the
+     * command died at five reporting a plain timeout, with nothing to suggest
+     * the request had been overruled. Same fail-silent class as F1 and F2. */
+    double t_req = 0, t_eff = 0;
+    j = cJSON_GetObjectItem(resp, "timeout_requested_ms"); if (cJSON_IsNumber(j)) t_req = j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "timeout_effective_ms"); if (cJSON_IsNumber(j)) t_eff = j->valuedouble;
+    if (t_req > 0 && t_eff > 0 && t_req > t_eff)
+        fprintf(stderr,
+                "[%s] warning: requested timeout %.0fms exceeds this daemon's "
+                "max_timeout_ms; %.0fms was used\n", node, t_req, t_eff);
+
     int ret = EXIT_OK;
     if (!strcmp(status, "auth_failed")) {
         fprintf(stderr, "Authentication failed\n"); ret = EXIT_AUTH_FAILED;
@@ -321,10 +352,22 @@ static int cmd_exec(cli_opts_t *opts, const char *command) {
         } else {
             ret = exit_code > 255 ? 255 : exit_code;
         }
-        /* detached — just print a brief ack */
+        /* detached — hand back the job id, which is the whole point: the
+         * caller can follow, wait on, or cancel what it just started. The id
+         * goes to STDOUT so it can be captured (`id=$(hl -D ...)`) while the
+         * human-readable line stays on stderr. */
         j = cJSON_GetObjectItem(resp, "detached");
         if (cJSON_IsTrue(j)) {
-            fprintf(stderr, "[%s] detached - launched in background\n", node);
+            cJSON *jid = cJSON_GetObjectItem(resp, "job_id");
+            if (cJSON_IsString(jid) && jid->valuestring[0]) {
+                printf("%s\n", jid->valuestring);
+                fprintf(stderr, "[%s] detached - job %s "
+                                "(job status/tail/wait/cancel %s)\n",
+                        node, jid->valuestring, jid->valuestring);
+            } else {
+                fprintf(stderr, "[%s] detached - launched in background "
+                                "(no job id: daemon predates 1.6.0)\n", node);
+            }
         } else if (stdout_file || stderr_file) {
             fprintf(stderr, "[%s] exit=%d time=%.0fms", node, exit_code, duration);
             if (stdout_file) fprintf(stderr, " stdout:%s", stdout_file);
@@ -608,6 +651,110 @@ static void get_stat_free(get_stat_t *gs) {
     }
     free(gs->sizes);
     gs->paths = NULL; gs->sizes = NULL; gs->count = 0;
+}
+
+/*
+ * Free space on the far side, for the destination of a put.
+ *
+ * Returns EXIT_OK and sets *free_bytes when the daemon answers. Any other
+ * outcome — an older daemon that does not know the request type, an
+ * unstattable path — is reported as a failure the CALLER IS EXPECTED TO
+ * IGNORE, falling back to the pre-1.6 behaviour of just trying the transfer.
+ * A capability probe must never be the thing that stops a put from happening.
+ */
+static int query_stat_fs(cli_opts_t *opts, const char *remote_path,
+                         uint64_t *free_bytes) {
+    *free_bytes = 0;
+
+    int fd = open_connection(opts);
+    if (fd < 0) return EXIT_CONN_FAILED;
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "stat_fs");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+    int sent = frame_send_json(fd, req);
+    cJSON_Delete(req);
+    if (sent != 0) { close(fd); return EXIT_CONN_FAILED; }
+
+    char *payload = NULL;
+    ssize_t n = frame_recv(fd, &payload);
+    close(fd);
+    if (n <= 0) { free(payload); return EXIT_PROTO_ERR; }
+
+    cJSON *resp = cJSON_Parse(payload);
+    free(payload);
+    if (!resp) return EXIT_PROTO_ERR;
+
+    const char *status = "";
+    cJSON *j = cJSON_GetObjectItem(resp, "status");
+    if (cJSON_IsString(j)) status = j->valuestring;
+    int rc = EXIT_REMOTE_ERR;
+    if (!strcmp(status, "ok")) {
+        j = cJSON_GetObjectItem(resp, "free_bytes");
+        if (cJSON_IsNumber(j)) { *free_bytes = (uint64_t)j->valuedouble; rc = EXIT_OK; }
+    }
+    cJSON_Delete(resp);
+    return rc;
+}
+
+/* `df <remote_path>` — the free-space probe, surfaced. Mostly it exists so the
+ * put pre-check is observable (and testable) rather than a hidden branch, but
+ * "how much room is left over there" is a question worth being able to ask. */
+static int cmd_df(cli_opts_t *opts, const char *remote_path) {
+    int fd = open_connection(opts);
+    if (fd < 0) return EXIT_CONN_FAILED;
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "stat_fs");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "path",    remote_path);
+    int sent = frame_send_json(fd, req);
+    cJSON_Delete(req);
+    if (sent != 0) { close(fd); return EXIT_CONN_FAILED; }
+
+    char *payload = NULL;
+    ssize_t n = frame_recv(fd, &payload);
+    close(fd);
+    if (n <= 0) { free(payload); return EXIT_PROTO_ERR; }
+    cJSON *resp = cJSON_Parse(payload);
+    free(payload);
+    if (!resp) return EXIT_PROTO_ERR;
+
+    const char *status = "", *node = "", *resolved = "", *emsg = NULL;
+    double freeb = 0, totalb = 0;
+    cJSON *j;
+    j = cJSON_GetObjectItem(resp, "status");      if (cJSON_IsString(j)) status   = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "node");        if (cJSON_IsString(j)) node     = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "resolved");    if (cJSON_IsString(j)) resolved = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "error_msg");   if (cJSON_IsString(j)) emsg     = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "free_bytes");  if (cJSON_IsNumber(j)) freeb    = j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "total_bytes"); if (cJSON_IsNumber(j)) totalb   = j->valuedouble;
+
+    int rc = EXIT_OK;
+    if (strcmp(status, "ok")) {
+        fprintf(stderr, "df: %s%s%s\n", status, emsg ? ": " : "", emsg ? emsg : "");
+        rc = EXIT_REMOTE_ERR;
+    } else if (opts->json_output) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+    } else {
+        printf("%.0f free of %.0f bytes on %s [%s]", freeb, totalb, resolved, node);
+        if (strcmp(resolved, remote_path))
+            printf("  (nearest existing ancestor of %s)", remote_path);
+        printf("\n");
+    }
+    cJSON_Delete(resp);
+    return rc;
 }
 
 /* Probe the remote daemon for size/type information about `remote_path`.
@@ -1034,7 +1181,12 @@ static int cmd_get_smart(cli_opts_t *opts, const char *remote_path,
     return dir_rc;
 }
 
-static int cmd_put_stream(cli_opts_t *opts, const char *local_path, const char *remote_path) {
+/* `sha_out`, when non-NULL, receives the digest the DAEMON confirmed after
+ * writing the file — the raw material for the directory-put manifest (F5).
+ * `quiet` suppresses the per-file success line, which is noise once there is a
+ * manifest summarising the whole tree. */
+static int cmd_put_stream_ex(cli_opts_t *opts, const char *local_path,
+                             const char *remote_path, char *sha_out, int quiet) {
     /* Stat local file for size */
     struct stat st;
     if (stat(local_path, &st) < 0) {
@@ -1191,13 +1343,19 @@ static int cmd_put_stream(cli_opts_t *opts, const char *local_path, const char *
         ret = EXIT_REMOTE_ERR;
     } else if (opts->json_output) {
         if (resp_json_str) printf("%s\n", resp_json_str);
-    } else {
+    } else if (!quiet) {
         fprintf(stderr, "[%s] put_stream ok: %s -> %s (%llu bytes, sha256=%.16s...)\n",
                 node, local_path, remote_path,
                 (unsigned long long)total, resp_sha);
     }
+    if (sha_out && ret == EXIT_OK) snprintf(sha_out, SHA256_HEX_LEN, "%s", resp_sha);
     free(resp_json_str);
     return ret;
+}
+
+static int cmd_put_stream(cli_opts_t *opts, const char *local_path,
+                          const char *remote_path) {
+    return cmd_put_stream_ex(opts, local_path, remote_path, NULL, 0);
 }
 
 /* ── Directory put (v1.5.1) ───────────────────────────────────────────────
@@ -1383,6 +1541,28 @@ static int cmd_put_dir(cli_opts_t *opts, const char *local_path,
                     g_put_skipped_nonreg);
     }
 
+    /* Remote free space (the asymmetry left open in 1.5.1).
+     *
+     * `get` has always checked the LOCAL filesystem before pulling; `put` had
+     * no equivalent because the daemon could not be asked. It can now, so ask
+     * — before the first byte rather than on whichever file runs the far side
+     * out of room, gigabytes in. A daemon that does not answer (older than
+     * 1.6.0, or a path it cannot stat) just means no check: the transfer
+     * proceeds exactly as it did before. */
+    uint64_t remote_free = 0;
+    if (query_stat_fs(opts, remote_path, &remote_free) == EXIT_OK && remote_free > 0) {
+        if (g_put_total + HL_GET_FREE_SPACE_HEADROOM > remote_free) {
+            fprintf(stderr,
+                    "put: not enough space on the remote filesystem for %s\n"
+                    "     need %llu bytes (+%llu headroom), %llu available\n",
+                    remote_path, (unsigned long long)g_put_total,
+                    (unsigned long long)HL_GET_FREE_SPACE_HEADROOM,
+                    (unsigned long long)remote_free);
+            put_list_free();
+            return EXIT_CLIENT_ERR;
+        }
+    }
+
     /* The daemon creates missing parents when mkdir is set, and it is the only
      * thing that can — so a directory put always implies it. */
     int saved_mkdir = opts->put_mkdir;
@@ -1390,6 +1570,7 @@ static int cmd_put_dir(cli_opts_t *opts, const char *local_path,
 
     int dir_rc = EXIT_OK;
     size_t done = 0;
+    size_t verified = 0;
     for (size_t i = 0; i < g_put_count; i++) {
         char local_full[HL_PATH_MAX], remote_full[HL_PATH_MAX];
         /* snprintf truncates silently, and a truncated path is a path to the
@@ -1407,11 +1588,23 @@ static int cmd_put_dir(cli_opts_t *opts, const char *local_path,
             break;
         }
 
-        int use_stream = opts->stream ||
+        /* --verify forces every file down the streaming path, which is the
+         * only one that hashes: the daemon writes the file, hashes what it
+         * wrote, and the client compares. A "verified" manifest built from the
+         * legacy base64 path would be a manifest of digests nobody checked. */
+        int use_stream = opts->stream || opts->verify ||
                          g_put_files[i].size > HL_STREAM_AUTO_THRESHOLD;
+        char sha[SHA256_HEX_LEN] = "";
         int file_rc = use_stream
-                    ? cmd_put_stream(opts, local_full, remote_full)
-                    : cmd_put       (opts, local_full, remote_full);
+                    ? cmd_put_stream_ex(opts, local_full, remote_full,
+                                        opts->verify ? sha : NULL, opts->verify)
+                    : cmd_put          (opts, local_full, remote_full);
+        if (file_rc == EXIT_OK && opts->verify && sha[0]) {
+            /* sha256sum's own format, so the manifest is worth keeping:
+             *   hl put ./tree /remote/tree --verify > manifest.txt */
+            printf("%s  %s\n", sha, g_put_files[i].rel);
+            verified++;
+        }
         if (file_rc != EXIT_OK) {
             fprintf(stderr,
                     "put: failed on %s (%zu of %zu transferred); stopping\n",
@@ -1424,12 +1617,400 @@ static int cmd_put_dir(cli_opts_t *opts, const char *local_path,
 
     opts->put_mkdir = saved_mkdir;
 
+    if (opts->verify) {
+        fflush(stdout);
+        /* The count is the whole point: "107 of 107 verified" is an answer,
+         * where a stream of per-file digests is only evidence. A short count
+         * means the loop stopped early, and the failure was already reported
+         * above. */
+        fprintf(stderr, "put: verify manifest — %zu of %zu files sha256-verified "
+                        "by the remote%s\n",
+                verified, g_put_count,
+                verified == g_put_count ? "" : "  ** INCOMPLETE **");
+    }
     if (dir_rc == EXIT_OK && !opts->json_output)
         fprintf(stderr, "put: %zu files, %llu bytes -> %s\n",
                 done, (unsigned long long)g_put_total, remote_path);
 
     put_list_free();
     return dir_rc;
+}
+
+/* ── Jobs ─────────────────────────────────────────────────────────────────
+ *
+ * `-D` used to be a one-way door: the command went off into the background and
+ * nothing came back — not an id, not the output, not the exit status. The
+ * documented workaround was to redirect to a file inside the command and poll
+ * it yourself, which is precisely the friction F6 was filed about.
+ *
+ * Now `-D` returns a job id and these verbs read the spool the daemon keeps:
+ *
+ *   job list                 what has run lately, newest first
+ *   job status <id>          state, exit code, spool sizes
+ *   job tail <id> [-f]       output so far, or follow to completion
+ *   job wait <id>            block until it ends, exit with ITS status
+ *   job cancel <id>          signal the job's process group
+ *
+ * `wait` and `-f` poll from the client rather than blocking the daemon. A
+ * server-side wait would tie up a forked worker for the life of the job, and
+ * with max_concurrent_io defaulting to 4, four waiters would shut every
+ * transfer out of the daemon. Polling costs one small round trip per interval,
+ * cannot exhaust anything, and survives a daemon restart mid-wait.
+ */
+#define HL_JOB_POLL_MS_DEFAULT 1000
+
+typedef struct {
+    char      state[32];
+    int       done;
+    int       exit_code;
+    long long created_at, ended_at;
+    long      duration_ms;
+    long long stdout_bytes, stderr_bytes;
+    long long stdout_original, stderr_original;
+    int       stdout_truncated, stderr_truncated;
+    char      command[8192];
+    char      error_msg[256];
+    char      node[64];
+} job_status_t;
+
+static void job_fill(cJSON *resp, job_status_t *js) {
+    cJSON *j;
+    memset(js, 0, sizeof(*js));
+    js->exit_code = -1;
+    j = cJSON_GetObjectItem(resp, "state");     if (cJSON_IsString(j)) snprintf(js->state, sizeof(js->state), "%s", j->valuestring);
+    j = cJSON_GetObjectItem(resp, "node");      if (cJSON_IsString(j)) snprintf(js->node, sizeof(js->node), "%s", j->valuestring);
+    j = cJSON_GetObjectItem(resp, "command");   if (cJSON_IsString(j)) snprintf(js->command, sizeof(js->command), "%s", j->valuestring);
+    j = cJSON_GetObjectItem(resp, "error_msg"); if (cJSON_IsString(j)) snprintf(js->error_msg, sizeof(js->error_msg), "%s", j->valuestring);
+    j = cJSON_GetObjectItem(resp, "done");      js->done = cJSON_IsTrue(j);
+    j = cJSON_GetObjectItem(resp, "exit_code");    if (cJSON_IsNumber(j)) js->exit_code    = j->valueint;
+    j = cJSON_GetObjectItem(resp, "created_at");   if (cJSON_IsNumber(j)) js->created_at   = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "ended_at");     if (cJSON_IsNumber(j)) js->ended_at     = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "duration_ms");  if (cJSON_IsNumber(j)) js->duration_ms  = (long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "stdout_bytes"); if (cJSON_IsNumber(j)) js->stdout_bytes = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "stderr_bytes"); if (cJSON_IsNumber(j)) js->stderr_bytes = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "stdout_original_bytes"); if (cJSON_IsNumber(j)) js->stdout_original = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "stderr_original_bytes"); if (cJSON_IsNumber(j)) js->stderr_original = (long long)j->valuedouble;
+    j = cJSON_GetObjectItem(resp, "stdout_truncated"); js->stdout_truncated = cJSON_IsTrue(j);
+    j = cJSON_GetObjectItem(resp, "stderr_truncated"); js->stderr_truncated = cJSON_IsTrue(j);
+}
+
+/* One job request/response round trip. Returns the parsed response (caller
+ * frees) or NULL, with *rc set to an EXIT_* value. */
+static cJSON *job_request(cli_opts_t *opts, const char *action, const char *job_id,
+                          const char *stream, long long offset, long long max_bytes,
+                          const char *signame, int *rc) {
+    *rc = EXIT_OK;
+    int fd = open_connection(opts);
+    if (fd < 0) { *rc = EXIT_CONN_FAILED; return NULL; }
+
+    char req_id[64];
+    make_request_id(req_id, sizeof(req_id));
+
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddNumberToObject(req, "version", 1);
+    cJSON_AddStringToObject(req, "type",    "job");
+    cJSON_AddStringToObject(req, "id",      req_id);
+    cJSON_AddStringToObject(req, "token",   opts->token);
+    cJSON_AddStringToObject(req, "action",  action);
+    if (job_id)  cJSON_AddStringToObject(req, "job_id", job_id);
+    if (stream)  cJSON_AddStringToObject(req, "stream", stream);
+    if (signame) cJSON_AddStringToObject(req, "signal", signame);
+    if (offset > 0)    cJSON_AddNumberToObject(req, "offset",    (double)offset);
+    if (max_bytes > 0) cJSON_AddNumberToObject(req, "max_bytes", (double)max_bytes);
+
+    int sent = frame_send_json(fd, req);
+    cJSON_Delete(req);
+    if (sent != 0) {
+        close(fd);
+        fprintf(stderr, "job: failed to send request\n");
+        *rc = EXIT_CONN_FAILED;
+        return NULL;
+    }
+
+    char *payload = NULL;
+    ssize_t n = frame_recv(fd, &payload);
+    close(fd);
+    if (n <= 0) { free(payload); *rc = EXIT_PROTO_ERR; return NULL; }
+
+    cJSON *resp = cJSON_Parse(payload);
+    free(payload);
+    if (!resp) { *rc = EXIT_PROTO_ERR; return NULL; }
+
+    const char *status = "", *emsg = NULL;
+    cJSON *j = cJSON_GetObjectItem(resp, "status");    if (cJSON_IsString(j)) status = j->valuestring;
+    j = cJSON_GetObjectItem(resp, "error_msg");        if (cJSON_IsString(j)) emsg   = j->valuestring;
+    if (strcmp(status, "ok") != 0) {
+        /* An old daemon does not know the type at all and says so; name that
+         * case rather than leaving the caller with "bad_request". */
+        if (!strcmp(status, "bad_request") && emsg && strstr(emsg, "unknown message type"))
+            fprintf(stderr, "job: this daemon predates the job API (hostlink < 1.6.0)\n");
+        else
+            fprintf(stderr, "job: %s%s%s\n", status, emsg ? ": " : "", emsg ? emsg : "");
+        /* `status` points into the cJSON tree, so decide before freeing it —
+         * reading it afterwards is a use-after-free, and it read as garbage
+         * often enough to turn "no such job" into a transport error. */
+        *rc = !strcmp(status, "not_found") ? EXIT_REMOTE_ERR : EXIT_HOSTLINK_ERR;
+        cJSON_Delete(resp);
+        return NULL;
+    }
+    return resp;
+}
+
+/* Terminal state → process exit status, on the same principle as exec: the
+ * caller should be able to write `hl job wait $id && deploy`. */
+static int job_exit_status(const job_status_t *js) {
+    if (!strcmp(js->state, "exited")) {
+        if (js->exit_code < 0) return EXIT_HOSTLINK_ERR;
+        return js->exit_code > 255 ? 255 : js->exit_code;
+    }
+    if (!strcmp(js->state, "timeout")) return EXIT_TIMEOUT;
+    return EXIT_HOSTLINK_ERR;    /* error, lost */
+}
+
+static void job_print_status(const job_status_t *js, const char *id) {
+    fprintf(stderr, "[%s] job %s %s", js->node, id, js->state);
+    if (js->done && !strcmp(js->state, "exited"))
+        fprintf(stderr, " exit=%d", js->exit_code);
+    if (js->duration_ms) fprintf(stderr, " time=%ldms", js->duration_ms);
+    fprintf(stderr, " out=%lldB err=%lldB",
+            js->stdout_bytes, js->stderr_bytes);
+    if (js->stdout_truncated)
+        fprintf(stderr, " stdout:CAPPED(%lld produced)", js->stdout_original);
+    if (js->stderr_truncated)
+        fprintf(stderr, " stderr:CAPPED(%lld produced)", js->stderr_original);
+    fprintf(stderr, "\n");
+    if (js->error_msg[0]) fprintf(stderr, "[%s] %s\n", js->node, js->error_msg);
+}
+
+static int cmd_job_status(cli_opts_t *opts, const char *id) {
+    int rc;
+    cJSON *resp = job_request(opts, "status", id, NULL, 0, 0, NULL, &rc);
+    if (!resp) return rc;
+    if (opts->json_output) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+        cJSON_Delete(resp);
+        return EXIT_OK;
+    }
+    job_status_t js;
+    job_fill(resp, &js);
+    cJSON_Delete(resp);
+    if (js.command[0]) fprintf(stderr, "[%s] cmd: %s\n", js.node, js.command);
+    job_print_status(&js, id);
+    return js.done ? job_exit_status(&js) : EXIT_OK;
+}
+
+static void sleep_ms(int ms) {
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+/* Print one stream from `offset` onward. Returns the new offset, or -1. */
+static long long job_drain(cli_opts_t *opts, const char *id, const char *stream,
+                           long long offset, FILE *out, job_status_t *js, int *rc) {
+    for (;;) {
+        cJSON *resp = job_request(opts, "tail", id, stream, offset, 0, NULL, rc);
+        if (!resp) return -1;
+        job_fill(resp, js);
+        cJSON *j = cJSON_GetObjectItem(resp, "data");
+        long long next = offset;
+        cJSON *nj = cJSON_GetObjectItem(resp, "next_offset");
+        if (cJSON_IsNumber(nj)) next = (long long)nj->valuedouble;
+        if (cJSON_IsString(j) && j->valuestring[0]) fputs(j->valuestring, out);
+        cJSON *bj = cJSON_GetObjectItem(resp, "binary");
+        if (cJSON_IsTrue(bj))
+            fprintf(stderr, "[%s] note: output contains NUL bytes; "
+                            "this text view stops at the first one per chunk\n", js->node);
+        cJSON_Delete(resp);
+        int progressed = (next > offset);
+        offset = next;
+        if (!progressed) return offset;   /* caught up with the writer */
+    }
+}
+
+static int cmd_job_tail(cli_opts_t *opts, const char *id, const char *stream,
+                        int follow, int interval_ms) {
+    /* -j is a single request/response: the caller wants the frame, including
+     * next_offset so it can page for itself. Following is a human mode. */
+    if (opts->json_output) {
+        int rc;
+        cJSON *resp = job_request(opts, "tail", id, stream, 0, 0, NULL, &rc);
+        if (!resp) return rc;
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+        cJSON_Delete(resp);
+        return EXIT_OK;
+    }
+    long long off = 0;
+    job_status_t js;
+    memset(&js, 0, sizeof(js));
+    int rc = EXIT_OK;
+    for (;;) {
+        off = job_drain(opts, id, stream, off, stdout, &js, &rc);
+        if (off < 0) return rc;
+        fflush(stdout);
+        if (!follow || js.done) break;
+        sleep_ms(interval_ms);
+    }
+    if (!opts->json_output) job_print_status(&js, id);
+    return js.done ? job_exit_status(&js) : EXIT_OK;
+}
+
+static int cmd_job_wait(cli_opts_t *opts, const char *id, int interval_ms,
+                        long long max_wait_ms, int show_output) {
+    long long waited = 0;
+    job_status_t js;
+    memset(&js, 0, sizeof(js));
+    for (;;) {
+        int rc;
+        cJSON *resp = job_request(opts, "status", id, NULL, 0, 0, NULL, &rc);
+        if (!resp) return rc;
+        job_fill(resp, &js);
+        cJSON_Delete(resp);
+        if (js.done) break;
+        if (max_wait_ms > 0 && waited >= max_wait_ms) {
+            fprintf(stderr,
+                    "[%s] job %s still %s after %lldms — giving up the wait "
+                    "(the job itself keeps running)\n",
+                    js.node, id, js.state, waited);
+            return EXIT_TIMEOUT;
+        }
+        sleep_ms(interval_ms);
+        waited += interval_ms;
+    }
+    if (show_output) {
+        int rc = EXIT_OK;
+        long long off = job_drain(opts, id, "stdout", 0, stdout, &js, &rc);
+        if (off >= 0) job_drain(opts, id, "stderr", 0, stderr, &js, &rc);
+        fflush(stdout);
+    }
+    if (opts->json_output) {
+        int rc;
+        cJSON *resp = job_request(opts, "status", id, NULL, 0, 0, NULL, &rc);
+        if (resp) {
+            char *s = cJSON_PrintUnformatted(resp);
+            if (s) { printf("%s\n", s); free(s); }
+            cJSON_Delete(resp);
+        }
+    } else {
+        job_print_status(&js, id);
+    }
+    return job_exit_status(&js);
+}
+
+static int cmd_job_cancel(cli_opts_t *opts, const char *id, int hard) {
+    int rc;
+    cJSON *resp = job_request(opts, "cancel", id, NULL, 0, 0,
+                              hard ? "KILL" : "TERM", &rc);
+    if (!resp) return rc;
+    if (opts->json_output) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+        cJSON_Delete(resp);
+        return EXIT_OK;
+    }
+    cJSON *sj = cJSON_GetObjectItem(resp, "signalled");
+    int ok = cJSON_IsTrue(sj);
+    job_status_t js;
+    job_fill(resp, &js);
+    cJSON_Delete(resp);
+    fprintf(stderr, "[%s] job %s: %s\n", js.node, id,
+            ok ? (hard ? "SIGKILL sent to the process group"
+                       : "SIGTERM sent to the process group")
+               : (js.error_msg[0] ? js.error_msg : "not signalled"));
+    return ok ? EXIT_OK : EXIT_REMOTE_ERR;
+}
+
+static int cmd_job_list(cli_opts_t *opts) {
+    int rc;
+    cJSON *resp = job_request(opts, "list", NULL, NULL, 0, 0, NULL, &rc);
+    if (!resp) return rc;
+    if (opts->json_output) {
+        char *s = cJSON_PrintUnformatted(resp);
+        if (s) { printf("%s\n", s); free(s); }
+        cJSON_Delete(resp);
+        return EXIT_OK;
+    }
+    cJSON *arr = cJSON_GetObjectItem(resp, "jobs");
+    int n = cJSON_IsArray(arr) ? cJSON_GetArraySize(arr) : 0;
+    if (n == 0) fprintf(stderr, "no jobs\n");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_GetArrayItem(arr, i);
+        job_status_t js;
+        job_fill(o, &js);
+        cJSON *idj = cJSON_GetObjectItem(o, "job_id");
+        const char *id = cJSON_IsString(idj) ? idj->valuestring : "?";
+        /* One line per job, command last so the columns stay aligned when it
+         * is long. */
+        char cmd[81];
+        size_t clen = strlen(js.command);
+        if (clen > sizeof(cmd) - 1) clen = sizeof(cmd) - 1;
+        memcpy(cmd, js.command, clen);
+        cmd[clen] = '\0';
+        for (char *p = cmd; *p; p++) if (*p == '\n') *p = ' ';
+        printf("%-12s  %-8s  exit=%-4d  %6ldms  out=%-9lld  %s\n",
+               id, js.state, js.done ? js.exit_code : -1,
+               js.duration_ms, js.stdout_bytes, cmd);
+    }
+    cJSON_Delete(resp);
+    return EXIT_OK;
+}
+
+/* `job <action> [<id>] [flags]` — flags accepted in any position, unknown ones
+ * refused rather than ignored (the F4 rule, applied to the new surface). */
+static int dispatch_job(cli_opts_t *opts, int argc, char *argv[], int from) {
+    const char *action = NULL, *id = NULL;
+    const char *stream = "stdout";
+    int follow = 0, hard = 0, show_output = 0;
+    int interval_ms = HL_JOB_POLL_MS_DEFAULT;
+    long long max_wait_ms = 0;   /* 0 = wait as long as it takes */
+
+    for (int i = from; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--stderr"))                             stream = "stderr";
+        else if (!strcmp(a, "--stdout"))                        stream = "stdout";
+        else if (!strcmp(a, "-f") || !strcmp(a, "--follow"))    follow = 1;
+        else if (!strcmp(a, "--kill"))                          hard = 1;
+        else if (!strcmp(a, "-o") || !strcmp(a, "--output"))    show_output = 1;
+        else if (!strcmp(a, "--interval")) {
+            if (i + 1 >= argc) { fprintf(stderr, "job: --interval requires ms\n"); return EXIT_CLIENT_ERR; }
+            interval_ms = atoi(argv[++i]);
+            if (interval_ms < 50) interval_ms = 50;
+        } else if (!strcmp(a, "--wait-timeout")) {
+            if (i + 1 >= argc) { fprintf(stderr, "job: --wait-timeout requires ms\n"); return EXIT_CLIENT_ERR; }
+            max_wait_ms = atoll(argv[++i]);
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr,
+                    "job: unknown flag '%s'\n"
+                    "  job flags: --stderr, -f/--follow, --interval <ms>,\n"
+                    "             --wait-timeout <ms>, -o/--output, --kill\n", a);
+            return EXIT_CLIENT_ERR;
+        } else if (!action) action = a;
+        else if (!id)       id     = a;
+        else {
+            fprintf(stderr, "job: unexpected argument '%s'\n", a);
+            return EXIT_CLIENT_ERR;
+        }
+    }
+
+    if (!action) {
+        fprintf(stderr, "job requires an action: list | status | tail | wait | cancel\n");
+        return EXIT_CLIENT_ERR;
+    }
+    if (!strcmp(action, "list")) return cmd_job_list(opts);
+
+    if (!id) {
+        fprintf(stderr, "job %s requires a job id\n", action);
+        return EXIT_CLIENT_ERR;
+    }
+    if (!strcmp(action, "status")) return cmd_job_status(opts, id);
+    if (!strcmp(action, "tail"))   return cmd_job_tail(opts, id, stream, follow, interval_ms);
+    if (!strcmp(action, "wait"))   return cmd_job_wait(opts, id, interval_ms, max_wait_ms, show_output);
+    if (!strcmp(action, "cancel")) return cmd_job_cancel(opts, id, hard);
+
+    fprintf(stderr, "job: unknown action '%s' "
+                    "(list | status | tail | wait | cancel)\n", action);
+    return EXIT_CLIENT_ERR;
 }
 
 static int cmd_targets(cli_opts_t *opts, int do_ping) {
@@ -1541,6 +2122,8 @@ static int parse_two_path_args(cli_opts_t *opts, int argc, char *argv[], int fro
             opts->put_mkdir = 1;
         } else if (!strcmp(a, "--stream")) {
             opts->stream = 1;
+        } else if (!strcmp(a, "--verify")) {
+            opts->verify = 1;
         } else if (!strcmp(a, "--mode")) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: --mode requires an octal argument\n", subcmd);
@@ -1580,7 +2163,7 @@ static int parse_two_path_args(cli_opts_t *opts, int argc, char *argv[], int fro
         } else if (a[0] == '-' && a[1] != '\0' && strcmp(a, "-")) {
             fprintf(stderr,
                     "%s: unknown flag '%s'\n"
-                    "  transfer flags are: --mkdir, --mode <oct>, --stream,\n"
+                    "  transfer flags are: --mkdir, --mode <oct>, --stream, --verify,\n"
                     "                      --exclude <pattern>  (put of a directory)\n"
                     "  (connection flags such as -t/-k/-T go before the subcommand)\n",
                     subcmd, a);
@@ -1638,6 +2221,11 @@ int main(int argc, char *argv[]) {
         {"mkdir",          no_argument,       NULL, 1003},  /* NEW: mkdir -p on put */
         {"mode",           required_argument, NULL, 1004},  /* NEW: file mode on put */
         {"stream",         no_argument,       NULL, 1005},  /* NEW: streaming get/put (no 90 MiB cap) */
+        /* --verify is accepted both here and among the subcommand's own
+         * arguments, as --mkdir/--mode/--stream/--exclude already are. Callers
+         * (and wrappers) put transfer flags on either side of the subcommand;
+         * accepting only one position is how F2 happened. */
+        {"verify",         no_argument,       NULL, 1007},
         {"exclude",        required_argument, NULL, 1006},  /* NEW: skip glob on directory put */
         {NULL, 0, NULL, 0}
     };
@@ -1663,7 +2251,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
             case 'k': snprintf(opts.token,        sizeof(opts.token),        "%s", optarg); break;
-            case 'T': opts.timeout_ms         = atoi(optarg); break;
+            case 'T': opts.timeout_ms = atoi(optarg); opts.timeout_explicit = 1; break;
             case 'C': opts.connect_timeout_ms = atoi(optarg); break;
             case 'F': snprintf(opts.targets_file, sizeof(opts.targets_file), "%s", optarg); break;
             case 'j': opts.json_output = 1; break;
@@ -1686,6 +2274,7 @@ int main(int argc, char *argv[]) {
             case 1003: opts.put_mkdir = 1; break;
             case 1004: opts.put_mode_val = (int)strtol(optarg, NULL, 8); break;
             case 1005: opts.stream = 1; break;
+            case 1007: opts.verify = 1; break;
             case 1006:
                 if (opts.exclude_count >= HL_MAX_EXCLUDES) {
                     fprintf(stderr, "too many --exclude patterns (max %d)\n",
@@ -1709,8 +2298,20 @@ int main(int argc, char *argv[]) {
                        "                              large files; checks local free space first)\n"
                        "  put-stream <local> <remote> Force-stream a put (sha256-verified)\n"
                        "  get-stream <remote> <local> Force-stream a get (sha256-verified)\n"
+                       "  df   <remote>               Free space on the filesystem that\n"
+                       "                              would hold <remote> (walks up to the\n"
+                       "                              nearest existing ancestor)\n"
                        "  ping                        Check if the daemon is alive\n"
                        "  targets                     List configured targets\n"
+                       "  job <action> [<id>]         Detached jobs. -D on an exec prints\n"
+                       "                              the id; these read it back:\n"
+                       "     job list                   recent jobs, newest first\n"
+                       "     job status <id>            state, exit code, spool sizes\n"
+                       "     job tail <id> [-f]         output so far; -f follows to the end\n"
+                       "     job wait <id> [-o]         block until it ends, exit with ITS\n"
+                       "                                status; -o then prints the output\n"
+                       "     job cancel <id> [--kill]   signal the job's process group\n"
+                       "   flags: --stderr  --interval <ms>  --wait-timeout <ms>\n"
                        "Options:\n"
                        "  -t <target>    Target name from targets config\n"
                        "  -s <socket>    Unix socket path\n"
@@ -1730,6 +2331,9 @@ int main(int argc, char *argv[]) {
                        "                 directory. Repeatable. Matches a basename, a full\n"
                        "                 relative path, or any leading directory component,\n"
                        "                 so --exclude .cache prunes the whole .cache/ tree.\n"
+                       "  --verify       Directory put: stream and sha256-verify every file,\n"
+                       "                 print a sha256sum-format manifest on stdout and a\n"
+                       "                 pass/fail count at the end\n"
                        "  --stream       Force streaming protocol (sha256 verified) even for\n"
                        "                 small files. `get` and `put` already auto-stream when\n"
                        "                 the file is large; this flag is for verification.\n"
@@ -1834,6 +2438,14 @@ int main(int argc, char *argv[]) {
             targets_free(all_targets); return EXIT_CLIENT_ERR;
         }
         rc = cmd_put_stream(&opts, local_path, remote_path);
+    } else if (!strcmp(subcmd, "df")) {
+        if (optind >= argc || optind + 1 != argc) {
+            fprintf(stderr, "df requires exactly one remote path\n");
+            targets_free(all_targets); return EXIT_CLIENT_ERR;
+        }
+        rc = cmd_df(&opts, argv[optind]);
+    } else if (!strcmp(subcmd, "job")) {
+        rc = dispatch_job(&opts, argc, argv, optind);
     } else if (!strcmp(subcmd, "targets")) {
         rc = cmd_targets(&opts, do_ping_targets);
     } else {
