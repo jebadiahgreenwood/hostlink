@@ -1,3 +1,25 @@
+> ## ✅ SHIPPED — this plan is closed (banner added 2026-07-26)
+>
+> `get` landed long ago and the asymmetry this document was written to fix is
+> gone in both directions:
+>
+> - **`get`** — files and directories, host and Spark, Unix socket and TCP.
+> - **`put`** — reached parity on directories in **v1.5.1** (F3), which is the
+>   mirror-image gap this plan predicted would show up next.
+> - **`--verify`** (v1.6.0) prints a `sha256sum`-format manifest and ends with
+>   "N of N verified by the remote" — the integrity check listed below under
+>   Testing is now a first-class flag, not a manual step.
+> - Files over 90 MiB stream automatically; a directory transfer checks remote
+>   free space (`hl df`) and refuses **before** the first byte if it will not fit.
+>
+> The 17 GB model transfer described below as the motivating pain is now a
+> single `hl-get -t spark <remote> <local>` — no HTTP server, no wget.
+>
+> Kept as the design record. **Nothing below is outstanding work.** Live status
+> is in `PROGRESS.md`.
+
+---
+
 # HostLink `get` Subcommand — Upgrade Plan
 
 ## Problem
